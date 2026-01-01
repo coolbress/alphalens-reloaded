@@ -31,3 +31,4 @@ update
 conda/recipe
 _static
 _version.py
+ABOUT_ALPHALENS.md

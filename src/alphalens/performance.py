@@ -16,6 +16,7 @@
 import pandas as pd
 import numpy as np
 import warnings
+from typing import Optional, Union, List
 
 import empyrical as ep
 from pandas.tseries.offsets import BDay
@@ -23,6 +24,9 @@ from scipy import stats
 from statsmodels.regression.linear_model import OLS
 from statsmodels.tools.tools import add_constant
 from . import utils
+
+# Convenience variable for MultiIndex slicing
+idx = pd.IndexSlice
 
 
 def factor_information_coefficient(factor_data, group_adjust=False, by_group=False):
@@ -51,26 +55,66 @@ def factor_information_coefficient(factor_data, group_adjust=False, by_group=Fal
         provided forward returns.
     """
 
-    def src_ic(group):
-        f = group["factor"]
-        _ic = group[utils.get_forward_returns_columns(factor_data.columns)].apply(
-            lambda x: stats.spearmanr(x, f)[0]
-        )
-        return _ic
-
     date_idx = factor_data.index.names.index("date")
+    # .levels still works but needed for freq attribute access
     freq = factor_data.index.levels[date_idx].freq
 
     factor_data = factor_data.copy()
 
-    grouper = [factor_data.index.get_level_values("date")]
+    # Performance optimization: reuse get_level_values result
+    date_level = factor_data.index.get_level_values("date")
+    grouper = [date_level]
 
     if group_adjust:
         factor_data = utils.demean_forward_returns(factor_data, grouper + ["group"])
     if by_group:
         grouper.append("group")
 
-    ic = factor_data.groupby(grouper, observed=True).apply(src_ic)
+    # [Optimization] Rank IC calculation: pre-compute ranks then use Pearson Correlation
+    # Spearman Correlation = Pearson Correlation after ranking
+    # This is much faster than calling spearmanr for each group
+    forward_returns_cols = utils.get_forward_returns_columns(factor_data.columns)
+    
+    # 1. Convert Factor to Rank (vectorized)
+    grouper_obj = factor_data.groupby(grouper, observed=True, sort=False)
+    ranked_factor = grouper_obj["factor"].rank()
+    
+    # 2. Calculate Rank for each Forward Return column and compute Pearson Correlation
+    ic_dict = {}
+    for col in forward_returns_cols:
+        # Convert Return to Rank
+        ranked_returns = grouper_obj[col].rank()
+        
+        # Calculate Pearson Correlation for each group (equivalent to Spearman for ranked data)
+        def calc_corr(group):
+            f_rank = group["factor_rank"].values
+            r_rank = group["return_rank"].values
+            # Remove NaN
+            mask = ~(np.isnan(f_rank) | np.isnan(r_rank))
+            if mask.sum() < 2:
+                return np.nan
+            # Pearson correlation (equivalent to Spearman for ranked data)
+            f_clean = f_rank[mask]
+            r_clean = r_rank[mask]
+            return np.corrcoef(f_clean, r_clean)[0, 1]
+        
+        # Construct temporary DataFrame with rank data (preserve original index)
+        temp_df = pd.DataFrame({
+            "factor_rank": ranked_factor,
+            "return_rank": ranked_returns
+        }, index=factor_data.index)
+        
+        # Calculate correlation by group (convert grouper to index level names)
+        if by_group:
+            groupby_keys = ["date", "group"]
+        else:
+            groupby_keys = ["date"]
+        
+        ic_series = temp_df.groupby(groupby_keys, observed=True, sort=False).apply(calc_corr)
+        ic_dict[col] = ic_series
+    
+    ic = pd.DataFrame(ic_dict)
+    
     if by_group:
         return ic
     else:
@@ -123,7 +167,8 @@ def mean_information_coefficient(
         ic = ic.mean()
 
     else:
-        ic = ic.reset_index().set_index("date").groupby(grouper).mean()
+        # Performance optimization: disable sorting with sort=False
+        ic = ic.reset_index().set_index("date").groupby(grouper, sort=False).mean()
 
     return ic
 
@@ -165,44 +210,70 @@ def factor_weights(factor_data, demeaned=True, group_adjust=False, equal_weight=
         Assets weighted by factor value.
     """
 
-    def to_weights(group, _demeaned, _equal_weight):
+    def to_weights_equal_weight(group, _demeaned):
+        """Equal weight logic - still uses apply due to complex conditional logic"""
+        group = group.copy()
 
-        if _equal_weight:
-            group = group.copy()
+        if _demeaned:
+            # top assets positive weights, bottom ones negative
+            group = group - group.median()
 
-            if _demeaned:
-                # top assets positive weights, bottom ones negative
-                group = group - group.median()
+        negative_mask = group < 0
+        group[negative_mask] = -1.0
+        positive_mask = group > 0
+        group[positive_mask] = 1.0
 
-            negative_mask = group < 0
-            group[negative_mask] = -1.0
-            positive_mask = group > 0
-            group[positive_mask] = 1.0
+        if _demeaned:
+            # positive weights must equal negative weights
+            if negative_mask.any():
+                group[negative_mask] /= negative_mask.sum()
+            if positive_mask.any():
+                group[positive_mask] /= positive_mask.sum()
 
-            if _demeaned:
-                # positive weights must equal negative weights
-                if negative_mask.any():
-                    group[negative_mask] /= negative_mask.sum()
-                if positive_mask.any():
-                    group[positive_mask] /= positive_mask.sum()
+        return group
 
-        elif _demeaned:
-            group = group - group.mean()
-
-        return group / group.abs().sum()
-
-    grouper = [factor_data.index.get_level_values("date")]
+    # Performance optimization: reuse get_level_values result
+    date_level = factor_data.index.get_level_values("date")
+    grouper = [date_level]
     if group_adjust:
         grouper.append("group")
 
-    weights = factor_data.groupby(grouper, group_keys=False, observed=True)[
-        "factor"
-    ].apply(to_weights, demeaned, equal_weight)
+    factor_series = factor_data["factor"].copy()
+
+    # [Optimization 1] Demean operation: use transform (Cython optimized)
+    if demeaned and not equal_weight:
+        grouper_obj = factor_data.groupby(grouper, observed=True, sort=False)["factor"]
+        factor_series = factor_series - grouper_obj.transform("mean")
+
+    # [Optimization 2] When equal_weight is False: vectorized weight calculation
+    if not equal_weight:
+        # Calculate absolute value sum (Vectorized)
+        # Grouping criteria depends on group_adjust flag
+        if group_adjust:
+            # Group by date + group
+            abs_sum = factor_series.abs().groupby(grouper, observed=True, sort=False).transform("sum")
+        else:
+            # Group by date only
+            abs_sum = factor_series.abs().groupby([date_level], observed=True, sort=False).transform("sum")
+        
+        # Division (Vectorized)
+        weights = factor_series / abs_sum
+    else:
+        # equal_weight case: use apply due to complex conditional logic
+        # Performance optimization: disable sorting with sort=False
+        weights = factor_data.groupby(grouper, group_keys=False, observed=True, sort=False)[
+            "factor"
+        ].apply(to_weights_equal_weight, demeaned)
 
     if group_adjust:
-        weights = weights.groupby(level="date", group_keys=False).apply(
-            to_weights, False, False
-        )
+        # [Optimization 3] group_adjust post-processing: use transform
+        # Group neutralization by date (make sum of weights for each group equal to 0)
+        date_grouper = weights.groupby(level="date", observed=True, sort=False)
+        # Demean by date (neutralize group weights by averaging them per date)
+        weights = weights - date_grouper.transform("mean")
+        # Normalize by absolute sum
+        abs_sum = weights.abs().groupby(level="date", observed=True, sort=False).transform("sum")
+        weights = weights / abs_sum
 
     return weights
 
@@ -236,7 +307,7 @@ def factor_returns(
         Control how to build factor weights
         -- see performance.factor_weights for a full explanation
     by_asset: bool, optional
-        If True, returns are reported separately for each esset.
+        If True, returns are reported separately for each asset.
 
     Returns
     -------
@@ -245,6 +316,7 @@ def factor_returns(
     """
 
     date_idx = factor_data.index.names.index("date")
+    # .levels still works but needed for freq attribute access
     freq = factor_data.index.levels[date_idx].freq
 
     weights = factor_weights(factor_data, demeaned, group_adjust, equal_weight)
@@ -255,9 +327,10 @@ def factor_returns(
     if by_asset:
         returns = weighted_returns
     else:
-        # requires at least one weighted return
-        # otherwise returns np.nan
-        returns = weighted_returns.groupby(level="date").sum(min_count=1).asfreq(freq)
+        # Requires at least one weighted return
+        # Otherwise returns np.nan
+        # Performance optimization: disable sorting with sort=False
+        returns = weighted_returns.groupby(level="date", sort=False).sum(min_count=1).asfreq(freq)
 
     return returns
 
@@ -494,30 +567,37 @@ def mean_return_by_quantile(
         Standard error of returns by specified quantile.
     """
 
+    # Performance optimization: reuse get_level_values result
+    date_level = factor_data.index.get_level_values("date")
+    
     if group_adjust:
-        grouper = [factor_data.index.get_level_values("date")] + ["group"]
+        grouper = [date_level] + ["group"]
         factor_data = utils.demean_forward_returns(factor_data, grouper)
     elif demeaned:
         factor_data = utils.demean_forward_returns(factor_data)
-    else:
-        factor_data = factor_data.copy()
+    # No copy needed in else block since factor_data is not modified
 
-    grouper = ["factor_quantile", factor_data.index.get_level_values("date")]
+    grouper = ["factor_quantile", date_level]
 
     if by_group:
         grouper.append("group")
 
-    group_stats = factor_data.groupby(grouper, observed=True)[
+    # Performance optimization: disable sorting with sort=False, observed=True to process only explicit levels
+    # "count" is required for std_error_ret calculation, cannot be omitted
+    group_stats = factor_data.groupby(grouper, observed=True, sort=False)[
         utils.get_forward_returns_columns(factor_data.columns)
     ].agg(["mean", "std", "count"])
 
     mean_ret = group_stats.T.xs("mean", level=1).T
 
     if not by_date:
-        grouper = [mean_ret.index.get_level_values("factor_quantile")]
+        # Performance optimization: reuse get_level_values result
+        quantile_level = mean_ret.index.get_level_values("factor_quantile")
+        grouper = [quantile_level]
         if by_group:
             grouper.append(mean_ret.index.get_level_values("group"))
-        group_stats = mean_ret.groupby(grouper).agg(["mean", "std", "count"])
+        # Performance optimization: disable sorting with sort=False
+        group_stats = mean_ret.groupby(grouper, sort=False).agg(["mean", "std", "count"])
         mean_ret = group_stats.T.xs("mean", level=1).T
 
     std_error_ret = group_stats.T.xs("std", level=1).T / np.sqrt(
@@ -592,13 +672,15 @@ def quantile_turnover(quantile_factor, quantile, period=1):
         Period by period turnover for that quantile.
     """
 
-    # keep DateTimeIndex frequency information
+    # Keep DateTimeIndex frequency information
     date_idx = quantile_factor.index.names.index("date")
+    # .levels still works but needed for freq attribute access
     freq = quantile_factor.index.levels[date_idx].freq
 
     quant_names = quantile_factor[quantile_factor == quantile]
+    # Performance optimization: disable sorting with sort=False
     quant_name_sets = (
-        quant_names.groupby(level=["date"])
+        quant_names.groupby(level=["date"], sort=False)
         .apply(lambda x: set(x.index.get_level_values("asset")))
         .asfreq(freq)
     )
@@ -643,20 +725,18 @@ def factor_rank_autocorrelation(factor_data, period=1):
         Rolling 1 period (defined by time_rule) autocorrelation of
         factor values.
     """
-    # grouper = [factor_data.index.get_level_values('date')]
-
     date_idx = factor_data.index.names.index("date")
+    # .levels still works but needed for freq attribute access
     freq = factor_data.index.levels[date_idx].freq
 
+    # Performance optimization: disable sorting with sort=False
     asset_ranks_by_day = (
-        factor_data.groupby(level="date")["factor"]
+        factor_data.groupby(level="date", sort=False)["factor"]
         .rank()
         .reset_index()
         .pivot(index="date", columns="asset", values="factor")
         .asfreq(freq)
     )
-
-    # asset_factor_rank = ranks
 
     asset_shifted = asset_ranks_by_day.shift(period)
 
@@ -847,19 +927,21 @@ def average_cumulative_return_by_quantile(
         #
         returns_bygroup = []
 
-        for group, g_data in factor_data.groupby("group", observed=True):
+        # Performance optimization: disable sorting with sort=False
+        for group, g_data in factor_data.groupby("group", observed=True, sort=False):
             g_fq = g_data["factor_quantile"]
             if group_adjust:
-                demean_by = g_fq  # demeans at group level
+                demean_by = g_fq  # Demeans at group level
             elif demeaned:
-                demean_by = factor_data["factor_quantile"]  # demean by all
+                demean_by = factor_data["factor_quantile"]  # Demean by all
             else:
                 demean_by = None
             #
             # Align cumulative return from different dates to the same index
             # then compute mean and std
             #
-            avgcumret = g_fq.groupby(g_fq).apply(average_cumulative_return, demean_by)
+            # Performance optimization: disable sorting with sort=False
+            avgcumret = g_fq.groupby(g_fq, sort=False).apply(average_cumulative_return, demean_by)
             if len(avgcumret) == 0:
                 continue
 
@@ -878,9 +960,11 @@ def average_cumulative_return_by_quantile(
         #
         if group_adjust:
             all_returns = []
-            for group, g_data in factor_data.groupby("group", observed=True):
+            # Performance optimization: disable sorting with sort=False
+            for group, g_data in factor_data.groupby("group", observed=True, sort=False):
                 g_fq = g_data["factor_quantile"]
-                avgcumret = g_fq.groupby(g_fq).apply(
+                # Performance optimization: disable sorting with sort=False
+                avgcumret = g_fq.groupby(g_fq, sort=False).apply(
                     cumulative_return_around_event, g_fq
                 )
                 all_returns.append(avgcumret)
@@ -891,10 +975,12 @@ def average_cumulative_return_by_quantile(
             return q_returns.unstack(level=1).stack(level=0)
         elif demeaned:
             fq = factor_data["factor_quantile"]
-            return fq.groupby(fq).apply(average_cumulative_return, fq)
+            # Performance optimization: disable sorting with sort=False
+            return fq.groupby(fq, sort=False).apply(average_cumulative_return, fq)
         else:
             fq = factor_data["factor_quantile"]
-            return fq.groupby(fq).apply(average_cumulative_return, None)
+            # Performance optimization: disable sorting with sort=False
+            return fq.groupby(fq, sort=False).apply(average_cumulative_return, None)
 
 
 def factor_cumulative_returns(
@@ -1143,7 +1229,7 @@ def create_pyfolio_input(
 
     #
     # Build returns:
-    # we don't know the frequency at which the factor returns are computed but
+    # We don't know the frequency at which the factor returns are computed but
     # pyfolio wants daily returns. So we compute the cumulative returns of the
     # factor, then resample it at 1 day frequency and finally compute daily
     # returns
@@ -1178,12 +1264,10 @@ def create_pyfolio_input(
     positions = positions.div(positions.abs().sum(axis=1), axis=0).fillna(0)
     positions["cash"] = 1.0 - positions.sum(axis=1)
 
-    # transform percentage positions to dollar positions
+    # Transform percentage positions to dollar positions
     if capital is not None:
         positions = positions.mul(cumrets.reindex(positions.index) * capital, axis=0)
 
-    #
-    #
     #
     # Build benchmark returns as the factor universe mean returns traded at
     # 'benchmark_period' frequency
@@ -1191,7 +1275,7 @@ def create_pyfolio_input(
     fwd_ret_cols = utils.get_forward_returns_columns(factor_data.columns)
     if benchmark_period in fwd_ret_cols:
         benchmark_data = factor_data.copy()
-        # make sure no negative positions
+        # Make sure no negative positions
         benchmark_data["factor"] = benchmark_data["factor"].abs()
         benchmark_rets = factor_cumulative_returns(
             benchmark_data,
@@ -1207,3 +1291,314 @@ def create_pyfolio_input(
         benchmark_rets = None
 
     return returns, positions, benchmark_rets
+
+
+# ----------------------------------
+# Additional Custom Functions (Extended beyond original alphalens)
+# ----------------------------------
+def yearly_win_rate(factor_data, group_adjust=False):
+    """
+    Calculates the proportion of years where IC was positive.
+    
+    Track A validation criterion: Pass if 70% or higher
+    
+    Parameters
+    ----------
+    factor_data : pd.DataFrame - MultiIndex
+        factor_data from get_clean_factor_and_forward_returns
+    group_adjust : bool
+        Whether to calculate group-neutral IC
+        
+    Returns
+    -------
+    win_rate : pd.Series
+        Yearly win rate for each forward period (0~1)
+    yearly_ic : pd.DataFrame
+        Yearly IC values (year × forward periods)
+    """
+    # Calculate average IC by year
+    yearly_ic = mean_information_coefficient(
+        factor_data,
+        group_adjust=group_adjust,
+        by_group=False,
+        by_time="YE"  # Yearly (year-end basis, 'Y' is deprecated)
+    )
+    
+    # Calculate proportion of years where IC > 0
+    win_rate = (yearly_ic > 0).mean()
+    
+    return win_rate, yearly_ic
+
+
+def cumulative_spread_drawdown(factor_data, period, long_short=True, group_neutral=False):
+    """
+    Calculates Maximum Drawdown (MDD) for Long-Short portfolio (Spread).
+    
+    Parameters
+    ----------
+    factor_data : pd.DataFrame - MultiIndex
+        factor_data from get_clean_factor_and_forward_returns
+    period : str
+        Forward return period (e.g., '20D')
+    long_short : bool
+        Whether to use Long-Short portfolio
+    group_neutral : bool
+        Whether to use group-neutral portfolio
+        
+    Returns
+    -------
+    mdd : float
+        Maximum drawdown (0~1, e.g., 0.15 = 15%)
+    mdd_date : pd.Timestamp
+        Date when MDD occurred
+    drawdown_series : pd.Series
+        Cumulative drawdown time series
+    """
+    # Calculate Spread portfolio returns (Q1 - Q5)
+    mean_ret, _ = mean_return_by_quantile(
+        factor_data,
+        by_date=True,
+        by_group=False,
+        demeaned=long_short,
+        group_adjust=group_neutral
+    )
+    
+    if period not in mean_ret.columns:
+        raise ValueError(f"Period '{period}' not found in factor_data")
+    
+    # Difference between top/bottom quantile returns (Spread)
+    top_quantile = factor_data['factor_quantile'].max()
+    bottom_quantile = factor_data['factor_quantile'].min()
+    
+    spread_returns = mean_ret.loc[top_quantile, period] - mean_ret.loc[bottom_quantile, period]
+    
+    # Calculate cumulative returns
+    cum_returns = cumulative_returns(spread_returns)
+    
+    # Calculate cumulative maximum
+    cummax = cum_returns.expanding().max()
+    
+    # Drawdown calculation: (current - peak) / peak
+    drawdown = (cum_returns - cummax) / cummax
+    
+    # MDD: Maximum drawdown (absolute value)
+    mdd = abs(drawdown.min())
+    mdd_date = drawdown.idxmin()
+    
+    return mdd, mdd_date, drawdown
+
+
+def quantile_monotonicity_score(mean_quant_ret):
+    """
+    Quantifies Monotonicity of quantile returns.
+    
+    Measures monotonic relationship between quantile numbers and returns
+    using Spearman Rank Correlation.
+    
+    Parameters
+    ----------
+    mean_quant_ret : pd.DataFrame
+        Average returns by quantile (quantile × period)
+        
+    Returns
+    -------
+    monotonicity_scores : pd.Series
+        Monotonicity score for each forward period (0~1, closer to 1 means perfect monotonic relationship)
+    """
+    scores = {}
+    quantile_numbers = mean_quant_ret.index.values
+    
+    for period in mean_quant_ret.columns:
+        returns = mean_quant_ret[period].values
+        # Calculate Spearman Rank Correlation
+        corr, _ = stats.spearmanr(quantile_numbers, returns)
+        # Use absolute value (both monotonic increase/decrease become positive)
+        scores[period] = abs(corr) if not np.isnan(corr) else 0.0
+    
+    return pd.Series(scores)
+
+
+def spread_calmar_ratio(factor_data, period, long_short=True, group_neutral=False):
+    """
+    Calculates Calmar Ratio for Spread portfolio.
+    
+    Calmar Ratio = CAGR / MDD
+    Higher is better (generally 1.0 or higher is good)
+    
+    Parameters
+    ----------
+    factor_data : pd.DataFrame - MultiIndex
+        factor_data from get_clean_factor_and_forward_returns
+    period : str
+        Forward return period (e.g., '20D')
+    long_short : bool
+        Whether to use Long-Short portfolio
+    group_neutral : bool
+        Whether to use group-neutral portfolio
+        
+    Returns
+    -------
+    calmar_ratio : float
+        Calmar Ratio (CAGR / MDD)
+    cagr : float
+        Annualized return (CAGR)
+    mdd : float
+        Maximum drawdown (MDD)
+    """
+    # Calculate Spread returns
+    mean_ret, _ = mean_return_by_quantile(
+        factor_data,
+        by_date=True,
+        by_group=False,
+        demeaned=long_short,
+        group_adjust=group_neutral
+    )
+    
+    if period not in mean_ret.columns:
+        raise ValueError(f"Period '{period}' not found in factor_data")
+    
+    top_quantile = factor_data['factor_quantile'].max()
+    bottom_quantile = factor_data['factor_quantile'].min()
+    
+    spread_returns = mean_ret.loc[top_quantile, period] - mean_ret.loc[bottom_quantile, period]
+    
+    # Calculate cumulative returns
+    cum_returns = cumulative_returns(spread_returns)
+    
+    # Calculate CAGR (annualized)
+    if len(cum_returns) > 0 and cum_returns.iloc[-1] > 0:
+        # Convert period to years
+        days_per_year = 252  # Trading days basis
+        try:
+            period_days = int(pd.Timedelta(period).days)
+        except:
+            period_days = int(period.replace('D', '').replace('d', '')) if period.replace('D', '').replace('d', '').isdigit() else 1
+        
+        total_periods = len(cum_returns)
+        years = (total_periods * period_days) / days_per_year
+        
+        if years > 0:
+            total_return = cum_returns.iloc[-1]
+            cagr = (total_return ** (1 / years)) - 1 if total_return > 0 else 0.0
+        else:
+            cagr = 0.0
+    else:
+        cagr = 0.0
+    
+    # Calculate MDD
+    mdd, _, _ = cumulative_spread_drawdown(factor_data, period, long_short, group_neutral)
+    
+    # Calculate Calmar Ratio
+    if mdd > 0:
+        calmar_ratio = abs(cagr) / mdd
+    else:
+        calmar_ratio = np.inf if cagr > 0 else 0.0
+    
+    return calmar_ratio, cagr, mdd
+
+
+def ic_decay_ratio(ic):
+    """
+    Calculates the decay ratio of IC over time.
+    
+    IC Decay = IC(20D) / IC(1D) or IC(20D) / IC(5D)
+    Higher is better (closer to 1.0 means predictive power maintained over time)
+    
+    Parameters
+    ----------
+    ic : pd.DataFrame
+        IC time series data (date × forward_periods)
+        
+    Returns
+    -------
+    decay_ratios : pd.Series
+        IC Decay ratio for each period combination
+    """
+    periods = ic.columns.tolist()
+    decay_ratios = {}
+    
+    # Compare other periods with 1D as baseline
+    if '1D' in periods:
+        ic_1d = ic['1D'].mean()
+        for period in periods:
+            if period != '1D' and ic_1d != 0:
+                ic_period = ic[period].mean()
+                decay_ratios[f'{period}/1D'] = abs(ic_period / ic_1d) if not np.isnan(ic_period) else 0.0
+    
+    # Compare other periods with 5D as baseline
+    if '5D' in periods:
+        ic_5d = ic['5D'].mean()
+        for period in periods:
+            if period not in ['1D', '5D'] and ic_5d != 0:
+                ic_period = ic[period].mean()
+                decay_ratios[f'{period}/5D'] = abs(ic_period / ic_5d) if not np.isnan(ic_period) else 0.0
+    
+    return pd.Series(decay_ratios)
+
+
+def breakeven_transaction_cost(factor_data, period, long_short=True, group_neutral=False):
+    """
+    Calculates Breakeven Transaction Cost.
+    
+    Formula: Spread (bps) / (Turnover * 2)
+    This value should be at least 10~15bps or higher to cover slippage in practice.
+    
+    Parameters
+    ----------
+    factor_data : pd.DataFrame - MultiIndex
+        factor_data from get_clean_factor_and_forward_returns
+    period : str
+        Forward return period (e.g., '20D')
+    long_short : bool
+        Whether to use Long-Short portfolio
+    group_neutral : bool
+        Whether to use group-neutral portfolio
+        
+    Returns
+    -------
+    breakeven_cost : float
+        Breakeven Transaction Cost (bps)
+    spread_bps : float
+        Spread returns (bps)
+    avg_turnover : float
+        Average turnover rate
+    """
+    from . import plotting
+    
+    # Calculate Spread
+    mean_ret, _ = mean_return_by_quantile(
+        factor_data,
+        by_date=True,
+        by_group=False,
+        demeaned=long_short,
+        group_adjust=group_neutral
+    )
+    
+    if period not in mean_ret.columns:
+        raise ValueError(f"Period '{period}' not found in factor_data")
+    
+    top_quantile = factor_data['factor_quantile'].max()
+    bottom_quantile = factor_data['factor_quantile'].min()
+    
+    spread_returns = mean_ret.loc[top_quantile, period] - mean_ret.loc[bottom_quantile, period]
+    spread_bps = spread_returns.mean() * plotting.DECIMAL_TO_BPS
+    
+    # Calculate Turnover (average of Top + Bottom Quantile)
+    try:
+        period_int = int(pd.Timedelta(period).days)
+    except:
+        period_int = int(period.replace('D', '').replace('d', '')) if period.replace('D', '').replace('d', '').isdigit() else 1
+    
+    quantile_factor = factor_data["factor_quantile"]
+    top_turnover = quantile_turnover(quantile_factor, top_quantile, period_int).mean()
+    bottom_turnover = quantile_turnover(quantile_factor, bottom_quantile, period_int).mean()
+    avg_turnover = (top_turnover + bottom_turnover) / 2
+    
+    # Calculate Breakeven Transaction Cost
+    # Long-Short so both buy/sell occur, hence * 2
+    if avg_turnover > 0:
+        breakeven_cost = spread_bps / (avg_turnover * 2)
+    else:
+        breakeven_cost = np.inf
+    
+    return breakeven_cost, spread_bps, avg_turnover

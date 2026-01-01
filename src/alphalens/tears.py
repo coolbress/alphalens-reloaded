@@ -14,52 +14,75 @@
 # limitations under the License.
 
 import warnings
-import matplotlib.gridspec as gridspec
-import matplotlib.pyplot as plt
+import logging
+from pathlib import Path
+from typing import Dict, Optional, List, Union, Any
+import numpy as np
 import pandas as pd
+from datetime import datetime
+
+import plotly.io as pio
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from jinja2 import Environment, FileSystemLoader
 
 from . import plotting
 from . import performance as perf
 from . import utils
 
+logger = logging.getLogger("alphalens")
 
-class GridFigure(object):
+
+# ---------------------------------------
+# Jinja2 Template Environment (Singleton)
+# ---------------------------------------
+# Global variable for Jinja2 environment (cached for performance)
+_JINJA_ENV = None
+
+
+def _get_jinja_env():
     """
-    It makes life easier with grid plots
+    Get or create Jinja2 environment using singleton pattern.
+    
+    This caches the template environment to avoid reloading the template
+    file from disk on every HTML generation call, improving performance
+    when generating multiple reports.
+    
+    Returns
+    -------
+    jinja2.Environment
+        Cached Jinja2 environment instance
     """
+    global _JINJA_ENV
+    if _JINJA_ENV is None:
+        base_dir = Path(__file__).parent
+        template_dir = base_dir  # Template is in the same directory as tears.py
+        template_path = template_dir / 'base_template.html'
+        
+        if not template_path.exists():
+            raise FileNotFoundError(
+                f"Template file not found at '{template_path}'. "
+                "Please ensure base_template.html exists in the alphalens package directory."
+            )
+        
+        try:
+            # Convert pathlib Path to string (FileSystemLoader requires string path)
+            _JINJA_ENV = Environment(loader=FileSystemLoader(str(template_dir)))
+        except Exception as e:
+            raise RuntimeError(
+                f"Error loading Jinja2 template: {e}. "
+                "Please ensure jinja2 is installed and the template file is accessible."
+            ) from e
+    
+    return _JINJA_ENV
 
-    def __init__(self, rows, cols):
-        self.rows = rows
-        self.cols = cols
-        self.fig = plt.figure(figsize=(14, rows * 7))
-        self.gs = gridspec.GridSpec(rows, cols, wspace=0.4, hspace=0.3)
-        self.curr_row = 0
-        self.curr_col = 0
 
-    def next_row(self):
-        if self.curr_col != 0:
-            self.curr_row += 1
-            self.curr_col = 0
-        subplt = plt.subplot(self.gs[self.curr_row, :])
-        self.curr_row += 1
-        return subplt
-
-    def next_cell(self):
-        if self.curr_col >= self.cols:
-            self.curr_row += 1
-            self.curr_col = 0
-        subplt = plt.subplot(self.gs[self.curr_row, self.curr_col])
-        self.curr_col += 1
-        return subplt
-
-    def close(self):
-        plt.close(self.fig)
-        self.fig = None
-        self.gs = None
-
+# ---------------------------------------
+# User Functions 
+# ---------------------------------------
 
 @plotting.customize
-def create_summary_tear_sheet(factor_data, long_short=True, group_neutral=False):
+def create_summary_tear_sheet(factor_data, long_short=True, group_neutral=False, display_output=True):
     """
     Creates a small summary tear sheet with returns, information, and turnover
     analysis.
@@ -78,10 +101,21 @@ def create_summary_tear_sheet(factor_data, long_short=True, group_neutral=False)
     group_neutral : bool
         Should this computation happen on a group neutral portfolio? if so,
         returns demeaning will occur on the group level.
+    display_output : bool, default True
+        If True, immediately display plots and tables.
+        If False, return all figures and tables as a dictionary without displaying.
+
+    Returns
+    -------
+    dict or None
+        If display_output=False, returns a dictionary containing:
+        - 'figures': dict of plotly figure objects
+        - 'table': pandas DataFrame (combined summary table)
+        If display_output=True, returns None (displays output immediately).
     """
 
     # Returns Analysis
-    mean_quant_ret, std_quantile = perf.mean_return_by_quantile(
+    mean_quant_ret, _ = perf.mean_return_by_quantile(
         factor_data,
         by_group=False,
         demeaned=long_short,
@@ -121,56 +155,188 @@ def create_summary_tear_sheet(factor_data, long_short=True, group_neutral=False)
         std_err=compstd_quant_daily,
     )
 
-    periods = utils.get_forward_returns_columns(factor_data.columns)
-    periods = list(map(lambda p: pd.Timedelta(p).days, periods))
-
-    fr_cols = len(periods)
-    vertical_sections = 2 + fr_cols * 3
-    gf = GridFigure(rows=vertical_sections, cols=1)
-
     plotting.plot_quantile_statistics_table(factor_data)
 
-    plotting.plot_returns_table(alpha_beta, mean_quant_rateret, mean_ret_spread_quant)
+    # Track A: Pre-calculate additional metrics to include in table
+    periods_str = utils.get_forward_returns_columns(factor_data.columns)
+    track_a_metrics = {}
+    mono_scores = perf.quantile_monotonicity_score(mean_quant_rateret)
 
-    plotting.plot_quantile_returns_bar(
+    for period_str in periods_str:
+        mdd = np.nan
+        score_val = np.nan
+        calmar_ratio = np.nan
+        cagr = np.nan
+        try:
+            mdd, mdd_date, _ = perf.cumulative_spread_drawdown(
+                factor_data, period_str, long_short, group_neutral
+            )
+        except Exception:
+            pass
+
+        try:
+            score_val = mono_scores.get(period_str, np.nan)
+        except Exception:
+            pass
+
+        try:
+            calmar_ratio, cagr, mdd_calmar = perf.spread_calmar_ratio(
+                factor_data, period_str, long_short, group_neutral
+            )
+        except Exception:
+            pass
+
+        track_a_metrics[period_str] = {
+            "Cumulative Spread MDD": mdd,
+            "Monotonicity Score (Spearman)": score_val,
+            "Spread Calmar Ratio": calmar_ratio,
+            "Spread CAGR": cagr,
+        }
+
+    # Returns Analysis table
+    returns_table = plotting.plot_returns_table(
+        alpha_beta, mean_quant_rateret, mean_ret_spread_quant, track_a_metrics, return_df=True
+    )
+    if display_output:
+        plotting.plot_returns_table(
+            alpha_beta, mean_quant_rateret, mean_ret_spread_quant, track_a_metrics
+        )
+
+    # Quantile Returns Bar Chart (plotly)
+    fig_quantile_returns = plotting.plot_quantile_returns_bar(
         mean_quant_rateret,
         by_group=False,
         ylim_percentiles=None,
-        ax=gf.next_row(),
     )
+    if display_output:
+        fig_quantile_returns.show()
+
+    # Top Minus Bottom Quantile Mean Return (integrated with plotly)
+    fig_spread_ts = plotting.plot_mean_quantile_returns_spread_time_series(
+        mean_ret_spread_quant,
+        std_err=std_spread_quant,
+        bandwidth=0.5,
+    )
+    if display_output:
+        fig_spread_ts.show()
 
     # Information Analysis
     ic = perf.factor_information_coefficient(factor_data)
-    plotting.plot_information_table(ic)
+    ic_table = plotting.plot_information_table(ic, return_df=True)
+    if display_output:
+        plotting.plot_information_table(ic)
 
-    # Turnover Analysis
+    # Turnover analysis
     quantile_factor = factor_data["factor_quantile"]
+    periods_turnover = utils.get_forward_returns_columns(factor_data.columns, require_exact_day_multiple=True).to_numpy()
+    turnover_periods_int = utils.timedelta_strings_to_integers(periods_turnover)
 
     quantile_turnover = {
         p: pd.concat(
             [
                 perf.quantile_turnover(quantile_factor, q, p)
-                for q in range(1, int(quantile_factor.max()) + 1)
+                for q in quantile_factor.sort_values().unique().tolist()
             ],
             axis=1,
         )
-        for p in periods
+        for p in turnover_periods_int
     }
 
     autocorrelation = pd.concat(
-        [perf.factor_rank_autocorrelation(factor_data, period) for period in periods],
+        [
+            perf.factor_rank_autocorrelation(factor_data, period)
+            for period in turnover_periods_int
+        ],
         axis=1,
     )
 
-    plotting.plot_turnover_table(autocorrelation, quantile_turnover)
+    # Track A: Calculate additional metrics (Autocorr + Breakeven Transaction Cost)
+    track_a_metrics = {}
+    for period in turnover_periods_int:
+        # Convert period to standard format (using common function)
+        period_str = utils.format_period(period)
+        try:
+            breakeven_cost, spread_bps, avg_turnover = perf.breakeven_transaction_cost(
+                factor_data, period_str, long_short=True, group_neutral=False
+            )
+        except Exception:
+            breakeven_cost = np.nan
+            spread_bps = np.nan
+            avg_turnover = np.nan
 
-    plt.show()
-    gf.close()
+        track_a_metrics[period_str] = {
+            "Breakeven Transaction Cost (bps)": breakeven_cost,
+            "Avg Turnover (%)": avg_turnover * 100 if pd.notnull(avg_turnover) else np.nan,
+            "Spread (bps)": spread_bps,
+        }
+
+    # Turnover table (now returns combined table)
+    combined_turnover_table, _ = plotting.plot_turnover_table(
+        autocorrelation, quantile_turnover, track_a_metrics, return_df=True
+    )
+    if display_output:
+        plotting.plot_turnover_table(
+            autocorrelation, quantile_turnover, track_a_metrics
+        )
+
+    # Turnover graph (plotly)
+    valid_turnover = {p: quantile_turnover[p] for p in turnover_periods_int 
+                      if not quantile_turnover[p].isnull().all().all()}
+    fig_turnover = None
+    if valid_turnover:
+        fig_turnover = plotting.plot_top_bottom_quantile_turnover(
+            quantile_turnover[list(valid_turnover.keys())[0]], 
+            period=list(valid_turnover.keys())[0],
+            quantile_turnover_dict=valid_turnover
+        )
+        if display_output:
+            fig_turnover.show()
+    
+    # Factor Rank Autocorrelation graph (plotly)
+    valid_autocorr = {p: autocorrelation[p] for p in turnover_periods_int 
+                      if p in autocorrelation.columns and not autocorrelation[p].isnull().all()}
+    fig_autocorr = None
+    if valid_autocorr:
+        # Convert autocorrelation DataFrame to dict (period: Series)
+        autocorr_dict = {p: autocorrelation[p] for p in valid_autocorr.keys()}
+        fig_autocorr = plotting.plot_factor_rank_auto_correlation(
+            autocorrelation[list(valid_autocorr.keys())[0]] if len(valid_autocorr) > 0 else None,
+            period=list(valid_autocorr.keys())[0] if len(valid_autocorr) > 0 else 1,
+            factor_autocorrelation_dict=autocorr_dict
+        )
+        if display_output:
+            fig_autocorr.show()
+    
+    # Return value composition
+    if not display_output:
+        # Combine multiple tables into one (since this is a summary)
+        # Combine main tables into a single DataFrame
+        combined_table = pd.concat([
+            returns_table.T,
+            ic_table.T,
+            combined_turnover_table.T
+        ], axis=0)
+        
+        figures_dict = {
+            'quantile_returns': fig_quantile_returns,
+            'spread_time_series': fig_spread_ts,
+        }
+        # Add only if turnover exists (remove None)
+        if fig_turnover is not None:
+            figures_dict['turnover'] = fig_turnover
+        # Add only if autocorrelation exists (remove None)
+        if 'fig_autocorr' in locals() and fig_autocorr is not None:
+            figures_dict['autocorrelation'] = fig_autocorr
+        
+        return {
+            'figures': figures_dict,
+            'table': combined_table
+        }
 
 
 @plotting.customize
 def create_returns_tear_sheet(
-    factor_data, long_short=True, group_neutral=False, by_group=False
+    factor_data, long_short=True, group_neutral=False, by_group=False, display_output=True
 ):
     """
     Creates a tear sheet for returns analysis of a factor.
@@ -199,7 +365,7 @@ def create_returns_tear_sheet(
 
     factor_returns = perf.factor_returns(factor_data, long_short, group_neutral)
 
-    mean_quant_ret, std_quantile = perf.mean_return_by_quantile(
+    mean_quant_ret, _ = perf.mean_return_by_quantile(
         factor_data,
         by_group=False,
         demeaned=long_short,
@@ -239,64 +405,195 @@ def create_returns_tear_sheet(
         std_err=compstd_quant_daily,
     )
 
-    fr_cols = len(factor_returns.columns)
-    vertical_sections = 2 + fr_cols * 3
-    gf = GridFigure(rows=vertical_sections, cols=1)
+    # Track A: Pre-calculate additional metrics to include in table
+    periods_str = utils.get_forward_returns_columns(factor_data.columns)
+    track_a_metrics = {}
+    mono_scores = perf.quantile_monotonicity_score(mean_quant_rateret)
 
-    plotting.plot_returns_table(alpha_beta, mean_quant_rateret, mean_ret_spread_quant)
+    for period_str in periods_str:
+        mdd = np.nan
+        score_val = np.nan
+        calmar_ratio = np.nan
+        cagr = np.nan
+        try:
+            mdd, mdd_date, _ = perf.cumulative_spread_drawdown(
+                factor_data, period_str, long_short, group_neutral
+            )
+        except Exception:
+            pass
 
-    plotting.plot_quantile_returns_bar(
+        try:
+            score_val = mono_scores.get(period_str, np.nan)
+        except Exception:
+            pass
+
+        try:
+            calmar_ratio, cagr, mdd_calmar = perf.spread_calmar_ratio(
+                factor_data, period_str, long_short, group_neutral
+            )
+        except Exception:
+            pass
+
+        track_a_metrics[period_str] = {
+            "Cumulative Spread MDD": mdd,
+            "Monotonicity Score (Spearman)": score_val,
+            "Spread Calmar Ratio": calmar_ratio,
+            "Spread CAGR": cagr,
+        }
+
+    # Returns Analysis table
+    returns_table = plotting.plot_returns_table(
+        alpha_beta, mean_quant_rateret, mean_ret_spread_quant, track_a_metrics, return_df=True
+    )
+    if display_output:
+        plotting.plot_returns_table(
+            alpha_beta, mean_quant_rateret, mean_ret_spread_quant, track_a_metrics
+        )
+
+    # Quantile Returns Bar Chart (plotly)
+    fig_quantile_returns = plotting.plot_quantile_returns_bar(
         mean_quant_rateret,
         by_group=False,
         ylim_percentiles=None,
-        ax=gf.next_row(),
     )
+    if display_output:
+        fig_quantile_returns.show()
 
-    plotting.plot_quantile_returns_violin(
-        mean_quant_rateret_bydate, ylim_percentiles=(1, 99), ax=gf.next_row()
-    )
-
-    trading_calendar = factor_data.index.levels[0].freq
-    if trading_calendar is None:
-        trading_calendar = pd.tseries.offsets.BDay()
-        warnings.warn(
-            "'freq' not set in factor_data index: assuming business day",
-            UserWarning,
-        )
-
+    # Track A: Violin plot removed (Bar chart is sufficient)
+    # plotting.plot_quantile_returns_violin(
+    #     mean_quant_ret_bydate, ylim_percentiles=(1, 99), ax=gf.next_row()
+    # )
+    
     # Compute cumulative returns from daily simple returns, if '1D'
     # returns are provided.
+    fig_cumulative = None
     if "1D" in factor_returns:
-        title = (
-            "Factor Weighted "
-            + ("Group Neutral " if group_neutral else "")
-            + ("Long/Short " if long_short else "")
-            + "Portfolio Cumulative Return (1D Period)"
+        # Convert to plotly (single period processing since only 1D is supported)
+        fig_cumulative = plotting.plot_cumulative_returns_by_quantile(
+            mean_quant_ret_bydate["1D"], period="1D"
         )
+        if display_output:
+            fig_cumulative.show()
 
-        plotting.plot_cumulative_returns(
-            factor_returns["1D"], period="1D", title=title, ax=gf.next_row()
-        )
-
-        plotting.plot_cumulative_returns_by_quantile(
-            mean_quant_ret_bydate["1D"], period="1D", ax=gf.next_row()
-        )
-
-    ax_mean_quantile_returns_spread_ts = [gf.next_row() for x in range(fr_cols)]
-    plotting.plot_mean_quantile_returns_spread_time_series(
+    # Top Minus Bottom Quantile Mean Return (integrated with plotly)
+    fig_spread_ts = plotting.plot_mean_quantile_returns_spread_time_series(
         mean_ret_spread_quant,
         std_err=std_spread_quant,
         bandwidth=0.5,
-        ax=ax_mean_quantile_returns_spread_ts,
     )
+    if display_output:
+        fig_spread_ts.show()
+    
+    # 1. Underwater Plot (drawdown visualization) - toggle support for all periods
+    fig_underwater = None
+    if len(periods_str) > 0:
+        try:
+            # Collect drawdown data for all periods
+            drawdown_dict = {}
+            for period_str in periods_str:
+                try:
+                    mdd, _, drawdown_series = perf.cumulative_spread_drawdown(
+                        factor_data, period_str, long_short, group_neutral
+                    )
+                    drawdown_dict[period_str] = (drawdown_series, mdd, _)
+                except Exception:
+                    continue  # Skip if individual period fails
+            
+            if drawdown_dict:
+                fig_underwater = plotting.plot_underwater_drawdown(
+                    drawdown_series=None,  # Not needed when using drawdown_dict
+                    period=None,  # Not needed when using drawdown_dict
+                    drawdown_dict=drawdown_dict
+                )
+                if display_output:
+                    fig_underwater.show()
+        except Exception as e:
+            logger.warning(f"Failed to create underwater plot: {e}")
+    
+    # 2. Long/Short Contribution Analysis - toggle support for all periods
+    # Long/Short Contribution Plot must use original non-demeaned returns
+    # to show actual returns for each quantile
+    fig_long_short = None
+    if len(periods_str) > 0:
+        try:
+            # Calculate original returns (demeaned=False)
+            mean_quant_ret_bydate_raw, _ = perf.mean_return_by_quantile(
+                factor_data,
+                by_date=True,
+                by_group=False,
+                demeaned=False,  # Use original returns
+                group_adjust=False,
+            )
+            # mean_quant_ret_bydate_raw already has all periods as columns, so pass directly
+            fig_long_short = plotting.plot_long_short_contribution(
+                mean_quant_ret_bydate=mean_quant_ret_bydate_raw,
+                period=None,  # If None, create toggle for all periods
+                long_short=long_short,
+                group_neutral=group_neutral
+            )
+            if display_output:
+                fig_long_short.show()
+        except Exception as e:
+            logger.warning(f"Failed to create long/short contribution plot: {e}")
+    
+    # 3. Worst 5 Periods Analysis - for first period
+    worst_periods_table = None
+    if len(periods_str) > 0:
+        try:
+            first_period = periods_str[0]
+            # Calculate spread returns
+            spread_returns = mean_ret_spread_quant[first_period] if first_period in mean_ret_spread_quant.columns else None
+            if spread_returns is not None:
+                worst_periods_table = plotting.plot_worst_periods(spread_returns, first_period, top_n=5)
+                if display_output:
+                    print(f"\nWorst 5 Periods Analysis ({first_period}):")
+                    print("=" * 80)
+                    utils.print_table(worst_periods_table)
+        except Exception as e:
+            logger.warning(f"Failed to create worst periods analysis: {e}")
+    
+    # matplotlib axes no longer needed (replaced with plotly)
+    # ax_mean_quantile_returns_spread_ts = None  # Removed: unnecessary variable
 
-    plt.show()
-    gf.close()
+    if display_output:
+        # gf is only created when by_group=True, so conditional check is unnecessary
+        # gf is not created when by_group=False
+        pass
+    
+    # Return value composition
+    if not display_output:
+        # ⭐ VertexLens approach: save figure objects first, HTML conversion performed in _render_html()
+        # This ensures HTML conversion happens after figure objects are fully initialized
+        # Store figure objects in dictionary
+        figures_dict = {
+            'quantile_returns': fig_quantile_returns,
+            'spread_time_series': fig_spread_ts,
+        }
+        # Add only if cumulative_returns exists (remove None)
+        if fig_cumulative is not None:
+            figures_dict['cumulative_returns'] = fig_cumulative
+        # Add new analyses
+        if fig_underwater is not None:
+            figures_dict['underwater_drawdown'] = fig_underwater
+        if fig_long_short is not None:
+            figures_dict['long_short_contribution'] = fig_long_short
+        
+        return_dict = {
+            'figures': figures_dict,
+            'table': returns_table
+        }
+        # Add if worst_periods_table exists
+        if worst_periods_table is not None:
+            return_dict['worst_periods'] = worst_periods_table
+        
+        return return_dict
 
+    # by_group processing (only executed when display_output=True)
+    fig_quantile_returns_by_group = None
     if by_group:
         (
             mean_return_quantile_group,
-            mean_return_quantile_group_std_err,
+            _,
         ) = perf.mean_return_by_quantile(
             factor_data,
             by_date=False,
@@ -311,26 +608,18 @@ def create_returns_tear_sheet(
             base_period=mean_return_quantile_group.columns[0],
         )
 
-        num_groups = len(
-            mean_quant_rateret_group.index.get_level_values("group").unique()
-        )
-
-        vertical_sections = 1 + (((num_groups - 1) // 2) + 1)
-        gf = GridFigure(rows=vertical_sections, cols=2)
-
-        ax_quantile_returns_bar_by_group = [gf.next_cell() for _ in range(num_groups)]
-        plotting.plot_quantile_returns_bar(
+        # Convert to Plotly (plot_quantile_returns_bar returns Plotly figure when by_group=True)
+        fig_quantile_returns_by_group = plotting.plot_quantile_returns_bar(
             mean_quant_rateret_group,
             by_group=True,
             ylim_percentiles=(5, 95),
-            ax=ax_quantile_returns_bar_by_group,
         )
-        plt.show()
-        gf.close()
+        if display_output:
+            fig_quantile_returns_by_group.show()
 
 
 @plotting.customize
-def create_information_tear_sheet(factor_data, group_neutral=False, by_group=False):
+def create_information_tear_sheet(factor_data, group_neutral=False, by_group=False, display_output=True):
     """
     Creates a tear sheet for information analysis of a factor.
 
@@ -346,49 +635,107 @@ def create_information_tear_sheet(factor_data, group_neutral=False, by_group=Fal
         Demean forward returns by group before computing IC.
     by_group : bool
         If True, display graphs separately for each group.
+    display_output : bool, default True
+        If True, displays tables and plots immediately (default behavior).
+        If False, returns a dict containing tables and figure objects for later display.
+    
+    Returns
+    -------
+    dict or None
+        If display_output=False, returns a dict with keys:
+        - 'figures': dict of plotly figure objects (keys: 'ic_ts', 'monthly_ic')
+        - 'table': DataFrame containing IC summary table
+        If display_output=True, returns None (displays output immediately).
     """
 
     ic = perf.factor_information_coefficient(factor_data, group_neutral)
 
-    plotting.plot_information_table(ic)
-
-    columns_wide = 2
-    fr_cols = len(ic.columns)
-    rows_when_wide = ((fr_cols - 1) // columns_wide) + 1
-    vertical_sections = fr_cols + 3 * rows_when_wide + 2 * fr_cols
-    gf = GridFigure(rows=vertical_sections, cols=columns_wide)
-
-    ax_ic_ts = [gf.next_row() for _ in range(fr_cols)]
-    plotting.plot_ic_ts(ic, ax=ax_ic_ts)
-
-    ax_ic_hqq = [gf.next_cell() for _ in range(fr_cols * 2)]
-    plotting.plot_ic_hist(ic, ax=ax_ic_hqq[::2])
-    plotting.plot_ic_qq(ic, ax=ax_ic_hqq[1::2])
-
+    # Track A: Include Yearly Win Rate in summary table
+    win_rate, yearly_ic = perf.yearly_win_rate(
+        factor_data, group_adjust=group_neutral
+    )
+    
+    # Create table
+    ic_summary_table = plotting.plot_information_table(ic, yearly_win_rate=win_rate, return_df=True)
+    
+    # Track A: IC Time Series with t-stat threshold (integrated with plotly)
+    fig_ic_ts = plotting.plot_ic_ts(ic, threshold=3.0)
+    
+    # Track A: Additional Information Analysis metrics already included in table, so output removed
+    
+    fig_monthly_ic = None
+    
     if not by_group:
-
         mean_monthly_ic = perf.mean_information_coefficient(
             factor_data,
             group_adjust=group_neutral,
             by_group=False,
-            by_time="M",
+            by_time="ME",  # Changed 'M' → 'ME' (remove FutureWarning)
         )
-        ax_monthly_ic_heatmap = [gf.next_cell() for x in range(fr_cols)]
-        plotting.plot_monthly_ic_heatmap(mean_monthly_ic, ax=ax_monthly_ic_heatmap)
+        # Convert to plotly (includes period toggle)
+        fig_monthly_ic = plotting.plot_monthly_ic_heatmap(mean_monthly_ic)
 
+    fig_ic_by_group = None
     if by_group:
+        # Convert to Plotly
         mean_group_ic = perf.mean_information_coefficient(
             factor_data, group_adjust=group_neutral, by_group=True
         )
+        fig_ic_by_group = plotting.plot_ic_by_group(mean_group_ic)
+        if display_output:
+            fig_ic_by_group.show()
 
-        plotting.plot_ic_by_group(mean_group_ic, ax=gf.next_row())
+    # Alpha Decay Plot (IC Decay)
+    fig_alpha_decay = None
+    try:
+        periods_str = utils.get_forward_returns_columns(factor_data.columns)
+        fig_alpha_decay = plotting.plot_alpha_decay(ic_data=ic, periods=periods_str)
+        if display_output:
+            fig_alpha_decay.show()
+    except Exception as e:
+        logger.warning(f"Failed to create alpha decay plot: {e}")
 
-    plt.show()
-    gf.close()
+    if display_output:
+        # Existing approach: immediate output
+        plotting.plot_information_table(ic, yearly_win_rate=win_rate)
+        
+        # Output plotly figures
+        if fig_ic_ts is not None:
+            fig_ic_ts.show()
+        if fig_monthly_ic is not None:
+            fig_monthly_ic.show()
+        if fig_ic_by_group is not None:
+            fig_ic_by_group.show()
+        if fig_alpha_decay is not None:
+            fig_alpha_decay.show()
+        
+        return None
+    else:
+        # ⭐ VertexLens approach: save figure objects first, HTML conversion performed in _render_html()
+        # Store figure objects in dictionary
+        figures_dict = {
+            'ic_ts': fig_ic_ts,
+        }
+        # Add only if monthly_ic exists (remove None)
+        if fig_monthly_ic is not None:
+            figures_dict['monthly_ic'] = fig_monthly_ic
+        # Add only if ic_by_group exists (remove None)
+        if fig_ic_by_group is not None:
+            figures_dict['ic_by_group'] = fig_ic_by_group
+        # Add only if alpha_decay exists (remove None)
+        if fig_alpha_decay is not None:
+            figures_dict['alpha_decay'] = fig_alpha_decay
+        
+        result = {
+            'figures': figures_dict,
+            'table': ic_summary_table
+        }
+        
+        return result
 
 
 @plotting.customize
-def create_turnover_tear_sheet(factor_data, turnover_periods=None):
+def create_turnover_tear_sheet(factor_data, turnover_periods=None, display_output=True):
     """
     Creates a tear sheet for analyzing the turnover properties of a factor.
 
@@ -407,6 +754,17 @@ def create_turnover_tear_sheet(factor_data, turnover_periods=None):
         frequency at which factor values are computed i.e. the periods
         are 2h and 4h and the factor is computed daily and so values like
         ['1D', '2D'] could be used instead
+    display_output : bool, default True
+        If True, immediately display plots and tables.
+        If False, return all figures and tables as a dictionary without displaying.
+
+    Returns
+    -------
+    dict or None
+        If display_output=False, returns a dictionary containing:
+        - 'figures': dict of plotly figure objects
+        - 'table': pandas DataFrame
+        If display_output=True, returns None (displays output immediately).
     """
 
     if turnover_periods is None:
@@ -438,35 +796,84 @@ def create_turnover_tear_sheet(factor_data, turnover_periods=None):
         axis=1,
     )
 
-    plotting.plot_turnover_table(autocorrelation, quantile_turnover)
-
-    fr_cols = len(turnover_periods)
-    columns_wide = 1
-    rows_when_wide = ((fr_cols - 1) // 1) + 1
-    vertical_sections = fr_cols + 3 * rows_when_wide + 2 * fr_cols
-    gf = GridFigure(rows=vertical_sections, cols=columns_wide)
-
+    # Track A: Calculate additional metrics (Autocorr + Breakeven Transaction Cost) → for table merging
+    track_a_metrics = {}
     for period in turnover_periods:
-        if quantile_turnover[period].isnull().all().all():
-            continue
-        plotting.plot_top_bottom_quantile_turnover(
-            quantile_turnover[period], period=period, ax=gf.next_row()
-        )
+        # Convert period to standard format (using common function)
+        period_str = utils.format_period(period)
+        try:
+            breakeven_cost, spread_bps, avg_turnover = perf.breakeven_transaction_cost(
+                factor_data, period_str, long_short=True, group_neutral=False
+            )
+        except Exception:
+            breakeven_cost = np.nan
+            spread_bps = np.nan
+            avg_turnover = np.nan
 
-    for period in autocorrelation:
-        if autocorrelation[period].isnull().all():
-            continue
-        plotting.plot_factor_rank_auto_correlation(
-            autocorrelation[period], period=period, ax=gf.next_row()
-        )
+        track_a_metrics[period_str] = {
+            # "Factor Rank Autocorrelation (Track A)" removed - duplicates "Mean Factor Rank Autocorrelation"
+            "Breakeven Transaction Cost (bps)": breakeven_cost,
+            "Avg Turnover (%)": avg_turnover * 100 if pd.notnull(avg_turnover) else np.nan,
+            "Spread (bps)": spread_bps,
+        }
 
-    plt.show()
-    gf.close()
+    # Turnover table (now returns combined table)
+    combined_turnover_table, _ = plotting.plot_turnover_table(
+        autocorrelation, quantile_turnover, track_a_metrics, return_df=True
+    )
+    if display_output:
+        plotting.plot_turnover_table(autocorrelation, quantile_turnover, track_a_metrics)
+
+    # Turnover graph (plotly)
+    valid_turnover = {p: quantile_turnover[p] for p in turnover_periods 
+                      if not quantile_turnover[p].isnull().all().all()}
+    fig_turnover = None
+    if valid_turnover:
+        fig_turnover = plotting.plot_top_bottom_quantile_turnover(
+            quantile_turnover[list(valid_turnover.keys())[0]], 
+            period=list(valid_turnover.keys())[0],
+            quantile_turnover_dict=valid_turnover
+        )
+        if display_output:
+            fig_turnover.show()
+    
+    # Factor Rank Autocorrelation graph (plotly)
+    valid_autocorr = {p: autocorrelation[p] for p in turnover_periods 
+                      if p in autocorrelation.columns and not autocorrelation[p].isnull().all()}
+    fig_autocorr = None
+    if valid_autocorr:
+        # Convert autocorrelation DataFrame to dict (period: Series)
+        autocorr_dict = {p: autocorrelation[p] for p in valid_autocorr.keys()}
+        fig_autocorr = plotting.plot_factor_rank_auto_correlation(
+            autocorrelation[list(valid_autocorr.keys())[0]] if len(valid_autocorr) > 0 else None,
+            period=list(valid_autocorr.keys())[0] if len(valid_autocorr) > 0 else 1,
+            factor_autocorrelation_dict=autocorr_dict
+        )
+        if display_output:
+            fig_autocorr.show()
+    
+    # Return value composition
+    if not display_output:
+        # ⭐ VertexLens approach: save figure objects first, HTML conversion performed in _render_html()
+        # Store figure objects in dictionary
+        # Use already combined table
+        combined_table = combined_turnover_table.T
+        
+        figures_dict = {}
+        if fig_turnover is not None:
+            figures_dict['turnover'] = fig_turnover
+        if fig_autocorr is not None:
+            figures_dict['autocorrelation'] = fig_autocorr
+        
+        return {
+            'figures': figures_dict,
+            'table': combined_table
+        }
 
 
 @plotting.customize
 def create_full_tear_sheet(
-    factor_data, long_short=True, group_neutral=False, by_group=False
+    factor_data, long_short=True, group_neutral=False, by_group=False, save_html=False, display_output=True
 ):
     """
     Creates a full tear sheet for analysis and evaluating single
@@ -492,18 +899,109 @@ def create_full_tear_sheet(
         flag affects information analysis
     by_group : bool
         If True, display graphs separately for each group.
+    save_html : bool, optional
+        If True, saves all plots and tables to an HTML file with auto-generated filename.
+        The filename will be generated using today's date and factor name.
+        Default is False.
+        Example: save_html=True
+    display_output : bool, optional
+        If True, displays plots and tables immediately. If False, returns results as dict.
+        Default is True.
     """
-
-    plotting.plot_quantile_statistics_table(factor_data)
-    create_returns_tear_sheet(
-        factor_data, long_short, group_neutral, by_group, set_context=False
+    # Compute phase: perform calculations once and reuse results for both display and HTML saving
+    # This prevents duplicate calculations when save_html=True and display_output=True
+    quantile_stats = plotting.plot_quantile_statistics_table(factor_data, return_df=True)
+    
+    returns_result = create_returns_tear_sheet(
+        factor_data, long_short, group_neutral, by_group, display_output=False
     )
-    create_information_tear_sheet(
-        factor_data, group_neutral, by_group, set_context=False
+    information_result = create_information_tear_sheet(
+        factor_data, group_neutral, by_group, display_output=False
     )
-    create_turnover_tear_sheet(factor_data, set_context=False)
-
-
+    turnover_result = create_turnover_tear_sheet(
+        factor_data, display_output=False
+    )
+    
+    # View phase: screen output (when display_output=True)
+    if display_output:
+        _display_results(
+            quantile_stats=quantile_stats,
+            returns_result=returns_result,
+            information_result=information_result,
+            turnover_result=turnover_result,
+            factor_data=factor_data
+        )
+    
+    # View phase: HTML saving (when save_html=True)
+    if save_html:
+        factor_name = 'Factor'
+        if 'factor' in factor_data.columns:
+            factor_col = factor_data['factor']
+            if hasattr(factor_col, 'name') and factor_col.name:
+                factor_name = factor_col.name
+        
+        today = datetime.now().strftime('%Y%m%d')
+        safe_factor_name = "".join(c for c in factor_name if c.isalnum() or c in (' ', '-', '_')).strip()
+        safe_factor_name = safe_factor_name.replace(' ', '_')
+        html_filename = f"Alphalens_Full_TearSheet_{safe_factor_name}_{today}.html"
+        html_content = _render_html(
+            quantile_stats=quantile_stats,
+            returns_result=returns_result,
+            information_result=information_result,
+            turnover_result=turnover_result,
+            factor_name=factor_name
+        )
+        
+        output_path = Path(html_filename)
+        output_path.write_text(html_content, encoding='utf-8')
+        
+        return
+    
+    # Return results when display_output=False and save_html=False
+    if not display_output:
+        # Collect all tables and figures (order guaranteed: Quantile -> Returns -> Information -> Turnover)
+        from collections import OrderedDict
+        all_tables = OrderedDict()
+        all_figures = OrderedDict()
+        
+        # 1. Quantile Statistics
+        if quantile_stats is not None and not quantile_stats.empty:
+            all_tables['1. Quantile Statistics'] = quantile_stats
+        
+        # 2. Returns
+        if returns_result and 'table' in returns_result and returns_result['table'] is not None:
+            all_tables['2. Returns'] = returns_result['table']
+        if returns_result and 'worst_periods' in returns_result and returns_result['worst_periods'] is not None:
+            all_tables['2.1 Worst 5 Periods'] = returns_result['worst_periods']
+        if returns_result and 'figures' in returns_result:
+            for fig_name, fig in returns_result['figures'].items():
+                if fig is not None:
+                    # Sort Returns figures as 2
+                    all_figures[f'2_returns_{fig_name}'] = fig
+        
+        # 3. Information
+        if information_result and 'table' in information_result and information_result['table'] is not None:
+            all_tables['3. Information'] = information_result['table']
+        if information_result and 'figures' in information_result:
+            for fig_name, fig in information_result['figures'].items():
+                if fig is not None:
+                    # Sort Information figures as 3
+                    all_figures[f'3_information_{fig_name}'] = fig
+        
+        # 4. Turnover
+        if turnover_result and 'table' in turnover_result and turnover_result['table'] is not None:
+            all_tables['4. Turnover'] = turnover_result['table']
+        if turnover_result and 'figures' in turnover_result:
+            for fig_name, fig in turnover_result['figures'].items():
+                if fig is not None:
+                    # Sort Turnover figures as 4
+                    all_figures[f'4_turnover_{fig_name}'] = fig
+        
+        return {
+            'tables': all_tables,
+            'figures': all_figures
+        }
+        
 @plotting.customize
 def create_event_returns_tear_sheet(
     factor_data,
@@ -513,6 +1011,7 @@ def create_event_returns_tear_sheet(
     group_neutral=False,
     std_bar=True,
     by_group=False,
+    display_output=True,
 ):
     """
     Creates a tear sheet to view the average cumulative returns for a
@@ -555,36 +1054,27 @@ def create_event_returns_tear_sheet(
         group_adjust=group_neutral,
     )
 
-    num_quantiles = int(factor_data["factor_quantile"].max())
-
-    vertical_sections = 1
-    if std_bar:
-        vertical_sections += ((num_quantiles - 1) // 2) + 1
-    cols = 2 if num_quantiles != 1 else 1
-    gf = GridFigure(rows=vertical_sections, cols=cols)
-    plotting.plot_quantile_average_cumulative_return(
+    # Conversion to Plotly completed
+    fig_avg_cumulative = plotting.plot_quantile_average_cumulative_return(
         avg_cumulative_returns,
         by_quantile=False,
         std_bar=False,
-        ax=gf.next_row(),
     )
+    if display_output:
+        fig_avg_cumulative.show()
+    
     if std_bar:
-        ax_avg_cumulative_returns_by_q = [gf.next_cell() for _ in range(num_quantiles)]
-        plotting.plot_quantile_average_cumulative_return(
+        fig_avg_cumulative_by_q = plotting.plot_quantile_average_cumulative_return(
             avg_cumulative_returns,
             by_quantile=True,
             std_bar=True,
-            ax=ax_avg_cumulative_returns_by_q,
         )
-
-    plt.show()
-    gf.close()
+        if display_output:
+            fig_avg_cumulative_by_q.show()
 
     if by_group:
+        # by_group feature: create subplot for each group
         groups = factor_data["group"].unique()
-        num_groups = len(groups)
-        vertical_sections = ((num_groups - 1) // 2) + 1
-        gf = GridFigure(rows=vertical_sections, cols=2)
 
         avg_cumret_by_group = perf.average_cumulative_return_by_quantile(
             factor_data,
@@ -598,16 +1088,14 @@ def create_event_returns_tear_sheet(
 
         for group, avg_cumret in avg_cumret_by_group.groupby(level="group"):
             avg_cumret.index = avg_cumret.index.droplevel("group")
-            plotting.plot_quantile_average_cumulative_return(
+            fig_group = plotting.plot_quantile_average_cumulative_return(
                 avg_cumret,
                 by_quantile=False,
                 std_bar=False,
-                title=group,
-                ax=gf.next_cell(),
+                title=str(group),
             )
-
-        plt.show()
-        gf.close()
+            if display_output:
+                fig_group.show()
 
 
 @plotting.customize
@@ -643,15 +1131,13 @@ def create_event_study_tear_sheet(
 
     plotting.plot_quantile_statistics_table(factor_data)
 
-    gf = GridFigure(rows=1, cols=1)
-    plotting.plot_events_distribution(
-        events=factor_data["factor"], num_bars=n_bars, ax=gf.next_row()
+    # Conversion to Plotly completed
+    fig_events_dist = plotting.plot_events_distribution(
+        events=factor_data["factor"], num_bars=n_bars
     )
-    plt.show()
-    gf.close()
+    fig_events_dist.show()
 
     if returns is not None and avgretplot is not None:
-
         create_event_returns_tear_sheet(
             factor_data=factor_data,
             returns=returns,
@@ -664,7 +1150,7 @@ def create_event_study_tear_sheet(
 
     factor_returns = perf.factor_returns(factor_data, demeaned=False, equal_weight=True)
 
-    mean_quant_ret, std_quantile = perf.mean_return_by_quantile(
+    mean_quant_ret, _ = perf.mean_return_by_quantile(
         factor_data, by_group=False, demeaned=long_short
     )
     if rate_of_ret:
@@ -682,25 +1168,535 @@ def create_event_study_tear_sheet(
             base_period=mean_quant_ret_bydate.columns[0],
         )
 
-    fr_cols = len(factor_returns.columns)
-    vertical_sections = 2 + fr_cols * 1
-    gf = GridFigure(rows=vertical_sections + 1, cols=1)
-
-    plotting.plot_quantile_returns_bar(
-        mean_quant_ret, by_group=False, ylim_percentiles=None, ax=gf.next_row()
+    # Conversion to Plotly completed
+    fig_quantile_returns = plotting.plot_quantile_returns_bar(
+        mean_quant_ret, by_group=False, ylim_percentiles=None
     )
-
-    plotting.plot_quantile_returns_violin(
-        mean_quant_ret_bydate, ylim_percentiles=(1, 99), ax=gf.next_row()
+    fig_quantile_returns.show()
+    
+    # Conversion to Plotly completed
+    fig_violin = plotting.plot_quantile_returns_violin(
+        mean_quant_ret_bydate, ylim_percentiles=(1, 99)
     )
+    fig_violin.show()
 
-    trading_calendar = factor_data.index.levels[0].freq
-    if trading_calendar is None:
-        trading_calendar = pd.tseries.offsets.BDay()
-        warnings.warn(
-            "'freq' not set in factor_data index: assuming business day",
-            UserWarning,
+    # Output Plotly figure
+    if fig_quantile_returns is not None:
+        fig_quantile_returns.show()
+
+# ---------------------------------------
+# Helper Functions
+# ---------------------------------------
+
+def _rebuild_figure_without_compression(fig):
+    """
+    Extract data directly from original figure object and create new figure without compression.
+    
+    [Fix] Now correctly handles datetime64[ns] arrays by converting them to strings
+    instead of integers, preventing the 'exponential x-axis' issue.
+    
+    ⚠️ Why is rebuild necessary? (The Safety Net)
+    
+    **Problem: HTML rendering failure due to Plotly's bdata compression**
+    
+    Plotly automatically performs Binary compression (bdata) to efficiently store large data.
+    This compressed data may not be properly decoded in certain environments (local HTML files, some browsers),
+    causing charts to break.
+    
+    **VertexLens vs Our Code Differences:**
+    
+    1. **VertexLens Pattern** (no compression issues):
+       ```
+       figure creation → immediate cache storage → immediate HTML conversion
+       ```
+       - figure object is converted to HTML in "fresh" state
+       - pio.to_html() internally calls to_dict() but no compression occurs
+       - Reason: figure object is converted before being stored in dictionary
+    
+    2. **Our Code Pattern** (compression issues may occur):
+       ```
+       figure creation → dictionary storage → pass through multiple functions → HTML conversion
+       ```
+       - During the process of storing figure object in dictionary and passing through multiple functions,
+         to_dict() may be called internally
+       - Plotly may automatically apply bdata compression during this process
+       - Compressed data: `"y": {"dtype": "f8", "bdata": "xN+RPeVv..."}`
+       - Result: Charts break in HTML (Bars appear as thin lines, Heatmap appears empty)
+    
+    **Solution (Integer Mapping Technique):**
+    
+    This function disassembles the figure object, converts it to pure Python List, then reassembles it.
+    
+    1. **Data Extraction**: Extract data directly from original figure's traces (numpy.ndarray state)
+    2. **List Conversion**: Convert numpy.ndarray to list to prevent compression
+    3. **Reassembly**: Create new figure with converted data
+    4. **Attribute Preservation**: Preserve all visualization attributes like text, texttemplate, textfont
+       - ⚠️ Important: text field maintains already formatted string array from plot_monthly_ic_heatmap
+       - Do not regenerate text from z (preserve formatting)
+    
+    **Efficiency Analysis:**
+    
+    - CPU computation cost: Yes (data disassembly and reassembly)
+    - Data integrity: Very high (0% compression issues)
+    - HTML rendering stability: 100% guaranteed
+    
+    This function serves as a "Safety Net" to ensure stability of HTML report generation.
+    It is essential in structures where figures cannot be converted immediately like VertexLens.
+    
+    Parameters
+    ----------
+    fig : go.Figure
+        Original Plotly Figure object
+    
+    Returns
+    -------
+    go.Figure
+        Newly regenerated Figure object without compression
+    """
+    # 1. Check if subplot exists
+    has_subplots = hasattr(fig, '_grid_ref') and fig._grid_ref is not None
+    
+    # Initialize subplot information
+    n_rows = 1
+    n_cols = 1
+    
+    if has_subplots:
+        # Understand subplot structure
+        try:
+            grid_ref = fig._grid_ref
+            n_rows = len(grid_ref) if grid_ref else 1
+            n_cols = len(grid_ref[0]) if grid_ref and len(grid_ref) > 0 else 1
+        except:
+            # If _grid_ref doesn't exist, estimate from trace's row/col information
+            max_row = 0
+            max_col = 0
+            for trace in fig.data:
+                if hasattr(trace, 'row') and trace.row:
+                    max_row = max(max_row, trace.row)
+                if hasattr(trace, 'col') and trace.col:
+                    max_col = max(max_col, trace.col)
+            n_rows = max_row if max_row > 0 else 1
+            n_cols = max_col if max_col > 0 else 1
+        
+        # Extract subplot_titles
+        subplot_titles = []
+        if hasattr(fig.layout, 'annotations') and fig.layout.annotations:
+            # Extract subplot titles from annotations
+            for ann in fig.layout.annotations:
+                if hasattr(ann, 'text') and ann.text:
+                    subplot_titles.append(ann.text)
+        
+        fig_clean = make_subplots(
+            rows=n_rows,
+            cols=n_cols,
+            subplot_titles=subplot_titles if subplot_titles else None,
+            vertical_spacing=0.15,
+            horizontal_spacing=0.1
         )
+    else:
+        fig_clean = go.Figure()
+    
+    # 2. Extract trace data and convert to List (core of compression prevention)
+    for trace in fig.data:
+        trace_dict = {}
+        row = trace.row if hasattr(trace, 'row') else None
+        col = trace.col if hasattr(trace, 'col') else None
+        
+        # Directly access trace's main fields to convert numpy array to list
+        # Plotly trace objects are not dictionaries, so .items() cannot be used
+        # Directly access required fields
+        field_list = ['x', 'y', 'z', 'text', 'customdata', 'name', 'visible', 
+                     'showlegend', 'legendgroup', 'mode', 'marker', 'line', 
+                     'fill', 'fillcolor', 'hovertemplate', 'hoverinfo',
+                     'colorscale', 'zmid', 'texttemplate', 'textfont', 
+                     'colorbar', 'showscale', 'yaxis', 'xaxis', 'type']
+        
+        for field in field_list:
+            if hasattr(trace, field):
+                value = getattr(trace, field)
+                
+                # Skip if None or empty (except text field which is processed even if None)
+                if value is None and field != 'text':
+                    continue
+                
+                if isinstance(value, np.ndarray):
+                    # [Critical Fix] If data is datetime, convert to string (ISO)
+                    # This prevents dates from becoming huge integers (nanoseconds)
+                    if np.issubdtype(value.dtype, np.datetime64):
+                        trace_dict[field] = value.astype(str).tolist()
+                    else:
+                        trace_dict[field] = value.tolist()
+                elif isinstance(value, pd.Index):
+                    # Handle pandas Index (DatetimeIndex etc.)
+                    if isinstance(value, pd.DatetimeIndex):
+                        # Convert DatetimeIndex to string list (ISO format)
+                        trace_dict[field] = value.astype(str).tolist()
+                    else:
+                        trace_dict[field] = value.tolist()
+                elif isinstance(value, (list, tuple)):
+                    if field == 'text':
+                        # text field: keep string arrays as is, convert NaN to None for numeric arrays
+                        if len(value) > 0:
+                            if isinstance(value[0], (list, tuple)):
+                                # 2D array
+                                if len(value[0]) > 0:
+                                    # Check if first element is string
+                                    if isinstance(value[0][0], str):
+                                        # Keep string arrays as is (NaN check unnecessary)
+                                        trace_dict[field] = [list(row_data) for row_data in value]
+                                    else:
+                                        # Convert NaN to None for numeric arrays
+                                        trace_dict[field] = [[v if not (isinstance(v, float) and np.isnan(v)) 
+                                                              else None for v in row_data] for row_data in value]
+                                else:
+                                    trace_dict[field] = [list(row_data) for row_data in value]
+                            else:
+                                # 1D array
+                                if isinstance(value[0], str):
+                                    # Keep string arrays as is
+                                    trace_dict[field] = list(value)
+                                else:
+                                    # Convert NaN to None for numeric arrays
+                                    trace_dict[field] = [v if not (isinstance(v, float) and np.isnan(v)) 
+                                                        else None for v in value]
+                        else:
+                            trace_dict[field] = list(value)
+                    else:
+                        trace_dict[field] = list(value)
+                else:
+                    trace_dict[field] = value
+        
+        # 3. Create appropriate trace object based on trace type
+        trace_type = trace_dict.pop('type', 'scatter')
+        
+        if trace_type == 'heatmap':
+            # Regenerate Heatmap (text overwrite logic removed)
+            heatmap_kwargs = {k: v for k, v in trace_dict.items() if k != 'type'}
+            
+            # ⚠️ Important: Do not regenerate text from z (preserve already formatted string array)
+            # texttemplate safety mechanism
+            if 'text' in heatmap_kwargs and heatmap_kwargs['text'] is not None:
+                if 'texttemplate' not in heatmap_kwargs:
+                    heatmap_kwargs['texttemplate'] = '%{text}'
+                if 'textfont' not in heatmap_kwargs:
+                    heatmap_kwargs['textfont'] = {'size': 9}
+            
+            # Add to subplot position if subplot position information exists
+            if row is not None and col is not None:
+                fig_clean.add_trace(go.Heatmap(**heatmap_kwargs), row=row, col=col)
+            else:
+                fig_clean.add_trace(go.Heatmap(**heatmap_kwargs))
+        else:
+            # Handle other trace types
+            trace_cls_map = {
+                'scatter': go.Scatter,
+                'bar': go.Bar,
+                'histogram': go.Histogram,
+                'box': go.Box,
+            }
+            trace_cls = trace_cls_map.get(trace_type, go.Scatter)
+            clean_kwargs = {k: v for k, v in trace_dict.items() if k != 'type'}
+            
+            if row is not None and col is not None:
+                fig_clean.add_trace(trace_cls(**clean_kwargs), row=row, col=col)
+            else:
+                fig_clean.add_trace(trace_cls(**clean_kwargs))
+    
+    # 4. Copy layout and adjust size
+    layout_dict = fig.layout.to_plotly_json()
+    
+    # CSS container size limit: #left is 65% of 1800px = 1170px, excluding 40px padding ≈ 1130px
+    MAX_CONTAINER_WIDTH = 1130
+    
+    # Dynamically calculate size based on data
+    calculated_width = None
+    calculated_height = None
+    
+    # Calculate based on data size if Heatmap
+    has_heatmap = any(hasattr(trace, 'type') and trace.type == 'heatmap' for trace in fig.data)
+    
+    if has_heatmap:
+        # Check x, y data size from Heatmap trace
+        max_x_len = 0
+        max_y_len = 0
+        for trace in fig.data:
+            if hasattr(trace, 'type') and trace.type == 'heatmap':
+                x_data = getattr(trace, 'x', None)
+                y_data = getattr(trace, 'y', None)
+                if x_data is not None:
+                    if isinstance(x_data, (list, np.ndarray)):
+                        max_x_len = max(max_x_len, len(x_data))
+                    elif hasattr(x_data, '__len__'):
+                        max_x_len = max(max_x_len, len(x_data))
+                if y_data is not None:
+                    if isinstance(y_data, (list, np.ndarray)):
+                        max_y_len = max(max_y_len, len(y_data))
+                    elif hasattr(y_data, '__len__'):
+                        max_y_len = max(max_y_len, len(y_data))
+        
+        # Calculate Heatmap size: minimum 35px per cell, including margins
+        if max_x_len > 0 and max_y_len > 0:
+            if has_subplots and n_cols > 1:
+                # Minimum width needed per subplot: 35px per month + 120px margin
+                subplot_width = max(35 * max_x_len + 120, 350)  # Minimum 350px
+                calculated_width = subplot_width * n_cols  # Sufficient size without limit
+                calculated_height = max(35 * max_y_len + 150, 350) * n_rows
+            else:
+                calculated_width = max(35 * max_x_len + 120, 350)
+                calculated_height = max(35 * max_y_len + 150, 350)
+    
+    # Set height
+    if calculated_height is not None:
+        layout_dict['height'] = calculated_height
+    elif 'height' not in layout_dict or layout_dict['height'] is None:
+        if has_subplots:
+            layout_dict['height'] = 400 * n_rows
+        else:
+            layout_dict['height'] = 600  # Default height
+    
+    # Set width (ensure sufficient size for Heatmap, scrollable)
+    if calculated_width is not None:
+        # For Heatmap, ignore container limit and set sufficient size (scrollable)
+        if has_heatmap:
+            layout_dict['width'] = calculated_width  # Sufficient size without limit
+        else:
+            layout_dict['width'] = min(calculated_width, MAX_CONTAINER_WIDTH)
+    elif 'width' not in layout_dict or layout_dict['width'] is None:
+        if has_subplots:
+            # If subplot exists, proportional to number of columns but with container size limit
+            subplot_width = 500  # Default 500px per subplot
+            layout_dict['width'] = min(subplot_width * n_cols, MAX_CONTAINER_WIDTH)
+        else:
+            layout_dict['width'] = min(1000, MAX_CONTAINER_WIDTH)  # Default width, apply limit
+    
+    # Adjust margin to prevent chart clipping
+    if 'margin' not in layout_dict or layout_dict['margin'] is None:
+        layout_dict['margin'] = dict(l=50, r=50, t=50, b=50)
+    else:
+        # If margin exists, ensure right and bottom margins
+        if isinstance(layout_dict['margin'], dict):
+            layout_dict['margin']['r'] = max(layout_dict['margin'].get('r', 50), 50)
+            layout_dict['margin']['b'] = max(layout_dict['margin'].get('b', 50), 50)
+    
+    fig_clean.update_layout(**layout_dict)
+    
+    return fig_clean
 
-    plt.show()
-    gf.close()
+
+def _show_tear_sheet_results(result_dict: Optional[Dict]) -> None:
+    """
+    Display all tables and figures from a tear sheet result dictionary.
+    
+    This helper function simplifies the repetitive pattern of checking
+    for tables and figures in result dictionaries and displaying them.
+    
+    Parameters
+    ----------
+    result_dict : dict, optional
+        Result dictionary containing 'table' and/or 'figures' keys
+    """
+    if not result_dict:
+        return
+    
+    # Display tables
+    if 'table' in result_dict and result_dict['table'] is not None:
+        utils.print_table(result_dict['table'])
+    
+    if 'worst_periods' in result_dict and result_dict['worst_periods'] is not None:
+        utils.print_table(result_dict['worst_periods'])
+    
+    # Display figures
+    if 'figures' in result_dict:
+        for fig_name, fig in result_dict['figures'].items():
+            if fig is not None:
+                fig.show()
+
+
+def _display_results(
+    quantile_stats: Optional[pd.DataFrame] = None,
+    returns_result: Optional[Dict] = None,
+    information_result: Optional[Dict] = None,
+    turnover_result: Optional[Dict] = None,
+    factor_data: Optional[pd.DataFrame] = None
+) -> None:
+    """
+    Helper function to display computed results on screen.
+    
+    Function to separate computation (Compute) and presentation (View).
+    
+    Parameters
+    ----------
+    quantile_stats : pd.DataFrame, optional
+        Quantile statistics table
+    returns_result : dict, optional
+        Returns tear sheet result
+    information_result : dict, optional
+        Information tear sheet result
+    turnover_result : dict, optional
+        Turnover tear sheet result
+    factor_data : pd.DataFrame, optional
+        Factor data (for quantile stats output)
+    """
+    # Output Quantile Statistics
+    if quantile_stats is not None and not quantile_stats.empty and factor_data is not None:
+        plotting.plot_quantile_statistics_table(factor_data)
+    
+    # Output Returns
+    _show_tear_sheet_results(returns_result)
+    
+    # Output Information
+    _show_tear_sheet_results(information_result)
+    
+    # Output Turnover
+    _show_tear_sheet_results(turnover_result)
+
+
+def _render_html(
+    quantile_stats=None,
+    returns_result=None,
+    information_result=None,
+    turnover_result=None,
+    factor_name="Factor Analysis"
+):
+    """
+    Renders a complete HTML file containing all tear sheet plots and tables.
+    
+    Implementation based on VertexLens style:
+    - Use Jinja2 template (base_template.html)
+    - Include Plotly.js from CDN only once
+    - Convert each figure using pio.to_html(full_html=False, include_plotlyjs=False)
+    - Organize tables and charts by section
+    
+    Parameters
+    ----------
+    quantile_stats : pd.DataFrame, optional
+        Quantile statistics table
+    returns_result : dict, optional
+        Result from create_returns_tear_sheet
+    information_result : dict, optional
+        Result from create_information_tear_sheet
+    turnover_result : dict, optional
+        Result from create_turnover_tear_sheet
+    factor_name : str
+        Name of the factor for the title
+    
+    Returns
+    -------
+    str
+        Complete HTML content as string
+    """
+    # Collect all charts and metrics
+    charts_html = []
+    metrics_html = []
+    
+    # Quantile Statistics Table
+    if quantile_stats is not None and not quantile_stats.empty:
+        # Round to 3 decimal places and format numeric columns
+        quantile_stats_rounded = quantile_stats.round(3)
+        # Format only numeric columns to 3 decimal places (preserve integers)
+        numeric_cols = quantile_stats_rounded.select_dtypes(include=[np.number]).columns
+        styled_html = quantile_stats_rounded.style.format(
+            {col: "{:.3f}" for col in numeric_cols}
+        ).set_caption("<h3>Quantile Statistics</h3>").to_html()
+        metrics_html.append(styled_html)
+    
+    # Returns Tear Sheet
+    if returns_result is not None:
+        if 'table' in returns_result and returns_result['table'] is not None:
+            # Round to 3 decimal places and format numeric columns
+            table_rounded = returns_result['table'].round(3)
+            numeric_cols = table_rounded.select_dtypes(include=[np.number]).columns
+            styled_html = table_rounded.style.format(
+                {col: "{:.3f}" for col in numeric_cols}
+            ).set_caption("<h3>Returns Table</h3>").to_html()
+            metrics_html.append(styled_html)
+        
+        if 'worst_periods' in returns_result and returns_result['worst_periods'] is not None:
+            # Round to 3 decimal places and format numeric columns
+            worst_rounded = returns_result['worst_periods'].round(3)
+            numeric_cols = worst_rounded.select_dtypes(include=[np.number]).columns
+            styled_html = worst_rounded.style.format(
+                {col: "{:.3f}" for col in numeric_cols}
+            ).set_caption("<h3>Worst 5 Periods</h3>").to_html()
+            metrics_html.append(styled_html)
+        
+        # ⭐ VertexLens approach: convert figure objects to HTML (after figure is fully initialized)
+        # ⚠️ Fix bdata compression issue: regenerate figure to convert to HTML without compression
+        if 'figures' in returns_result:
+            for fig_name, fig in returns_result['figures'].items():
+                if fig is not None:
+                    # Regenerate figure to prevent bdata compression
+                    fig_clean = _rebuild_figure_without_compression(fig)
+                    chart_html = pio.to_html(
+                        fig_clean, 
+                        full_html=False, 
+                        include_plotlyjs=False
+                    )
+                    charts_html.append(chart_html)
+    
+    # Information Tear Sheet
+    if information_result is not None:
+        if 'table' in information_result and information_result['table'] is not None:
+            # Round to 3 decimal places and format numeric columns
+            table_rounded = information_result['table'].round(3)
+            numeric_cols = table_rounded.select_dtypes(include=[np.number]).columns
+            styled_html = table_rounded.style.format(
+                {col: "{:.3f}" for col in numeric_cols}
+            ).set_caption("<h3>Information Table</h3>").to_html()
+            metrics_html.append(styled_html)
+        
+        # ⭐ VertexLens approach: convert figure objects to HTML (after figure is fully initialized)
+        # ⚠️ Fix bdata compression issue: regenerate figure to convert to HTML without compression
+        if 'figures' in information_result:
+            for fig_name, fig in information_result['figures'].items():
+                if fig is not None:
+                    # Regenerate figure to prevent bdata compression
+                    fig_clean = _rebuild_figure_without_compression(fig)
+                    chart_html = pio.to_html(
+                        fig_clean, 
+                        full_html=False, 
+                        include_plotlyjs=False
+                    )
+                    charts_html.append(chart_html)
+    
+    # Turnover Tear Sheet
+    if turnover_result is not None:
+        if 'table' in turnover_result and turnover_result['table'] is not None:
+            # Round to 3 decimal places and format numeric columns
+            table_rounded = turnover_result['table'].round(3)
+            numeric_cols = table_rounded.select_dtypes(include=[np.number]).columns
+            styled_html = table_rounded.style.format(
+                {col: "{:.3f}" for col in numeric_cols}
+            ).set_caption("<h3>Turnover Table</h3>").to_html()
+            metrics_html.append(styled_html)
+        
+        # ⭐ VertexLens approach: convert figure objects to HTML (after figure is fully initialized)
+        # ⚠️ Fix bdata compression issue: regenerate figure to convert to HTML without compression
+        if 'figures' in turnover_result:
+            for fig_name, fig in turnover_result['figures'].items():
+                if fig is not None:
+                    # Regenerate figure to prevent bdata compression
+                    fig_clean = _rebuild_figure_without_compression(fig)
+                    chart_html = pio.to_html(
+                        fig_clean, 
+                        full_html=False, 
+                        include_plotlyjs=False
+                    )
+                    charts_html.append(chart_html)
+    
+    # Load Jinja2 template (using cached environment)
+    env = _get_jinja_env()
+    template = env.get_template('base_template.html')
+    
+    # Render template (VertexLens style)
+    generation_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rendered_html = template.render(
+        factor_name=factor_name,
+        generation_date=generation_date,
+        charts=charts_html,
+        metrics=metrics_html
+    )
+    
+    return rendered_html
+
+

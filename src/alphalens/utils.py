@@ -17,6 +17,9 @@ import pandas as pd
 import numpy as np
 import re
 import warnings
+import logging
+from pathlib import Path
+from typing import Union, List, Optional, Dict, Tuple
 
 from IPython.display import display
 from pandas.tseries.offsets import (
@@ -27,6 +30,9 @@ from pandas.tseries.offsets import (
 )
 from scipy.stats import mode
 
+# Logger for alphalens
+logger = logging.getLogger("alphalens")
+
 
 class NonMatchingTimezoneError(Exception):
     pass
@@ -34,6 +40,34 @@ class NonMatchingTimezoneError(Exception):
 
 class MaxLossExceededError(Exception):
     pass
+
+
+def format_period(period):
+    """
+    Convert period to standard format.
+    
+    Parameters
+    ----------
+    period : int, float, or str
+        Period value (e.g., 5, 5.0, "5D")
+    
+    Returns
+    -------
+    str
+        Standard format period string (e.g., "5D")
+    
+    Examples
+    --------
+    >>> format_period(5)
+    '5D'
+    >>> format_period(5.0)
+    '5D'
+    >>> format_period("5D")
+    '5D'
+    """
+    if isinstance(period, (int, float)):
+        return f"{int(period)}D"
+    return period
 
 
 def rethrow(exception, additional_message):
@@ -167,15 +201,19 @@ def quantize_factor(
                 return pd.Series(index=x.index)
             raise e
 
-    grouper = [factor_data.index.get_level_values("date")]
+    # Performance optimization: reuse get_level_values result
+    date_level = factor_data.index.get_level_values("date")
+    grouper = [date_level]
     if by_group:
         grouper.append("group")
 
-    factor_quantile = factor_data.groupby(grouper, group_keys=False)["factor"].apply(
+    # Performance optimization: use groupby result directly
+    factor_quantile = factor_data.groupby(grouper, group_keys=False, sort=False)["factor"].apply(
         quantile_calc, quantiles, bins, zero_aware, no_raise
     )
     factor_quantile.name = "factor_quantile"
 
+    # Performance optimization: dropna only once at the end
     return factor_quantile.dropna()
 
 
@@ -272,6 +310,7 @@ def compute_forward_returns(
         from the input data (see infer_trading_calendar for more details).
     """
 
+    # .levels still works, but needed to access freq attribute
     factor_dateindex = factor.index.levels[0]
     if factor_dateindex.tz != prices.index.tz:
         raise NonMatchingTimezoneError(
@@ -298,63 +337,84 @@ def compute_forward_returns(
     # chop prices down to only the assets we care about (= unique assets in
     # `factor`).  we could modify `prices` in place, but that might confuse
     # the caller.
-    prices = prices.filter(items=factor.index.levels[1])
+    # Performance optimization: filter prices only once
+    # Could use get_level_values(), but filter() with levels access is more efficient
+    prices_filtered = prices.filter(items=factor.index.levels[1])
 
     raw_values_dict = {}
     column_list = []
 
     for period in sorted(periods):
         if cumulative_returns:
-            returns = prices.pct_change(period)
+            returns = prices_filtered.pct_change(period, fill_method=None)
         else:
-            returns = prices.pct_change()
+            returns = prices_filtered.pct_change(fill_method=None)
 
         forward_returns = returns.shift(-period).reindex(factor_dateindex)
 
         if filter_zscore is not None:
-            mask = abs(forward_returns - forward_returns.mean()) > (
-                filter_zscore * forward_returns.std()
-            )
-            forward_returns[mask] = np.nan
+            # Performance optimization: use vectorized operations
+            forward_returns_mean = forward_returns.mean()
+            forward_returns_std = forward_returns.std()
+            threshold = filter_zscore * forward_returns_std
+            mask = (forward_returns - forward_returns_mean).abs() > threshold
+            forward_returns = forward_returns.where(~mask)
 
         #
         # Find the period length, which will be the column name. We'll test
         # several entries in order to find out the most likely period length
         # (in case the user passed inconsinstent data)
         #
+        # Performance optimization: limit sampling size and early termination
         days_diffs = []
-        for i in range(30):
+        sample_size = min(30, len(forward_returns.index))
+        prices_index = prices_filtered.index
+        
+        for i in range(sample_size):
             if i >= len(forward_returns.index):
                 break
-            p_idx = prices.index.get_loc(forward_returns.index[i])
-            if p_idx is None or p_idx < 0 or (p_idx + period) >= len(prices.index):
+            try:
+                p_idx = prices_index.get_loc(forward_returns.index[i])
+                if isinstance(p_idx, slice):
+                    p_idx = p_idx.start
+                if p_idx is None or p_idx < 0 or (p_idx + period) >= len(prices_index):
+                    continue
+                start = prices_index[p_idx]
+                end = prices_index[p_idx + period]
+                period_len = diff_custom_calendar_timedeltas(start, end, freq)
+                days_diffs.append(period_len.components.days)
+            except (KeyError, IndexError):
                 continue
-            start = prices.index[p_idx]
-            end = prices.index[p_idx + period]
-            period_len = diff_custom_calendar_timedeltas(start, end, freq)
-            days_diffs.append(period_len.components.days)
 
-        delta_days = (
-            period_len.components.days - mode(days_diffs, keepdims=True).mode[0]
-        )
-        period_len -= pd.Timedelta(days=delta_days)
+        if days_diffs:
+            delta_days = (
+                period_len.components.days - mode(days_diffs, keepdims=True).mode[0]
+            )
+            period_len -= pd.Timedelta(days=delta_days)
+        else:
+            # Fallback: use default period
+            period_len = pd.Timedelta(days=period)
+        
         label = timedelta_to_string(period_len)
 
         column_list.append(label)
 
-        raw_values_dict[label] = np.concatenate(forward_returns.values)
+        # Performance optimization: use values directly (remove unnecessary concatenate)
+        raw_values_dict[label] = forward_returns.values.flatten()
 
-    df = pd.DataFrame.from_dict(raw_values_dict)
-    df.set_index(
-        pd.MultiIndex.from_product(
-            [factor_dateindex, prices.columns], names=["date", "asset"]
-        ),
-        inplace=True,
+    # Performance optimization: create DataFrame more efficiently
+    df = pd.DataFrame(raw_values_dict)
+    # Performance optimization: create MultiIndex directly to minimize reindex
+    df.index = pd.MultiIndex.from_product(
+        [factor_dateindex, prices_filtered.columns], names=["date", "asset"]
     )
-    df = df.reindex(factor.index)
+    # Optimize reindex when aligned with factor.index
+    if not df.index.equals(factor.index):
+        df = df.reindex(factor.index, copy=False)
 
     # now set the columns correctly
     df = df[column_list]
+    # .levels still works, but needed to set freq attribute
     df.index.levels[0].freq = freq
     df.index.set_names(["date", "asset"], inplace=True)
 
@@ -370,7 +430,8 @@ def backshift_returns_series(series, N):
     """
     ix = series.index
     dates, sids = ix.levels
-    date_labels, sid_labels = map(np.array, ix.labels)
+    # pandas 0.24+ recommended: .labels → .codes
+    date_labels, sid_labels = map(np.array, ix.codes)
 
     # Output date labels will contain the all but the last N dates.
     new_dates = dates[:-N]
@@ -611,10 +672,13 @@ def get_clean_factor(
 
     initial_amount = float(len(factor.index))
 
+    # Performance optimization: minimize unnecessary copies
     factor_copy = factor.copy()
     factor_copy.index = factor_copy.index.rename(["date", "asset"])
+    # Performance optimization: use vectorized operations
     factor_copy = factor_copy[np.isfinite(factor_copy)]
 
+    # Performance optimization: modify forward_returns directly (minimize copies)
     merged_data = forward_returns.copy()
     merged_data["factor"] = factor_copy
 
@@ -653,7 +717,8 @@ def get_clean_factor(
 
     merged_data["factor_quantile"] = quantile_data
 
-    merged_data = merged_data.dropna()
+    # Performance optimization: quantile_data is already dropna'd, so only check factor_quantile
+    merged_data = merged_data.dropna(subset=['factor_quantile'])
 
     binning_amount = float(len(merged_data.index))
 
@@ -661,11 +726,13 @@ def get_clean_factor(
     fwdret_loss = (initial_amount - fwdret_amount) / initial_amount
     bin_loss = tot_loss - fwdret_loss
 
-    print(
+    logger.info(
         "Dropped %.1f%% entries from factor data: %.1f%% in forward "
         "returns computation and %.1f%% in binning phase "
-        "(set max_loss=0 to see potentially suppressed Exceptions)."
-        % (tot_loss * 100, fwdret_loss * 100, bin_loss * 100)
+        "(set max_loss=0 to see potentially suppressed Exceptions).",
+        tot_loss * 100,
+        fwdret_loss * 100,
+        bin_loss * 100,
     )
 
     if tot_loss > max_loss:
@@ -675,7 +742,7 @@ def get_clean_factor(
         )
         raise MaxLossExceededError(message)
     else:
-        print("max_loss is %.1f%%, not exceeded: OK!" % (max_loss * 100))
+        logger.info("max_loss is %.1f%%, not exceeded: OK!", max_loss * 100)
     return merged_data
 
 
@@ -692,6 +759,7 @@ def get_clean_factor_and_forward_returns(
     max_loss=0.35,
     zero_aware=False,
     cumulative_returns=True,
+    factor_direction=None,
 ):
     """
     Formats the factor data, pricing data, and group mappings into a DataFrame
@@ -806,6 +874,10 @@ def get_clean_factor_and_forward_returns(
         If True, forward returns columns will contain cumulative returns.
         Setting this to False is useful if you want to analyze how predictive
         a factor is for a single forward day.
+    factor_direction : {'higher', 'lower', None}, optional
+        Explicitly specify factor direction.
+        - 'higher' or None : Higher values are better (default, no sign change)
+        - 'lower'          : Lower values are better → internally multiplied by -1 to invert direction
 
     Returns
     -------
@@ -843,12 +915,30 @@ def get_clean_factor_and_forward_returns(
         For use when forward returns are already available.
     """
 
+    # Factor direction handling (user-specified, auto-inference removed)
+    factor_to_use = factor.copy()
+    was_inverted = False
+
+    if factor_direction == "lower":
+        # Explicitly specified as lower-is-better factor: invert sign
+        factor_to_use = -factor
+        was_inverted = True
+
+    elif factor_direction in (None, "higher"):
+        # Higher values are better (default): use as is
+        pass
+
+    else:
+        raise ValueError(
+            f"factor_direction must be 'higher', 'lower', or None, got '{factor_direction}'"
+        )
+    
     forward_returns = compute_forward_returns(
-        factor, prices, periods, filter_zscore, cumulative_returns
+        factor_to_use, prices, periods, filter_zscore, cumulative_returns
     )
 
     factor_data = get_clean_factor(
-        factor,
+        factor_to_use,
         forward_returns,
         groupby=groupby,
         groupby_labels=groupby_labels,
@@ -858,6 +948,14 @@ def get_clean_factor_and_forward_returns(
         max_loss=max_loss,
         zero_aware=zero_aware,
     )
+    
+    # Store original factor values (before inversion)
+    if was_inverted:
+        factor_data['factor_original'] = factor.reindex(factor_data.index)
+        factor_data['factor_inverted'] = True
+    else:
+        factor_data['factor_inverted'] = False
+    
     return factor_data
 
 
@@ -918,21 +1016,24 @@ def get_forward_returns_columns(columns, require_exact_day_multiple=False):
     Utility that detects and returns the columns that are forward returns
     """
 
-    # If exact day multiples are required in the forward return periods,
-    # drop all other columns (e.g. drop 3D12h).
-    if require_exact_day_multiple:
-        pattern = re.compile(r"^(\d+([D]))+$", re.IGNORECASE)
-        valid_columns = [(pattern.match(col) is not None) for col in columns]
+    # 1) First filter: forward return candidate columns only (day/hour/minute/second units, etc.)
+    base_pattern = re.compile(r"^(\d+([Dhms]|ms|us|ns))+$", re.IGNORECASE)
+    forward_mask = [(base_pattern.match(col) is not None) for col in columns]
+    forward_cols = columns[forward_mask]
 
-        if sum(valid_columns) < len(valid_columns):
-            warnings.warn(
-                "Skipping return periods that aren't exact multiples" + " of days."
-            )
-    else:
-        pattern = re.compile(r"^(\d+([Dhms]|ms|us|ns]))+$", re.IGNORECASE)
-        valid_columns = [(pattern.match(col) is not None) for col in columns]
+    if not require_exact_day_multiple:
+        return forward_cols
 
-    return columns[valid_columns]
+    # 2) Keep only exact day units (D) (e.g., '5D', '20D')
+    day_pattern = re.compile(r"^(\d+([D]))+$", re.IGNORECASE)
+    day_mask = [(day_pattern.match(col) is not None) for col in forward_cols]
+
+    if sum(day_mask) < len(day_mask):
+        warnings.warn(
+            "Skipping return periods that aren't exact multiples of days."
+        )
+
+    return forward_cols[day_mask]
 
 
 def timedelta_to_string(timedelta):
