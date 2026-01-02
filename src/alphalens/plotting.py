@@ -530,13 +530,14 @@ def plot_ic_ts(ic, threshold=None):
         
         is_visible = (period == actual_periods[0] if actual_periods else False)
         
-        # IC line
+        # IC line (thin line for better visibility with moving average)
         fig.add_trace(go.Scatter(
             x=ic_series.index,
             y=ic_series.values,
             mode='lines',
             name='IC',
-            line=dict(color='steelblue', width=1.5 if threshold else 1),
+            line=dict(color='steelblue', width=0.5),
+            opacity=0.6,  # Slight transparency to make moving average more visible
             visible=is_visible,
             legendgroup='ic',
             showlegend=True
@@ -1323,14 +1324,14 @@ def plot_mean_quantile_returns_spread_time_series(
             is_visible = (period == actual_periods[0] if actual_periods else False)
             
             # Mean returns spread line (left y-axis)
-            # Increased transparency to make moving average more visible
+            # Thin line with slight transparency to make moving average more visible
             fig.add_trace(go.Scatter(
                 x=spread_bps.index,
                 y=spread_bps.values,
                 mode='lines',
                 name=f'mean returns spread ({period})',
                 line=dict(color='forestgreen', width=0.5),
-                opacity=0.2,  # Increased transparency (was 0.4) to make moving average more visible
+                opacity=0.6,  # Same as IC time series for consistency
                 visible=is_visible,
                 legendgroup=f'spread_{period}',
                 showlegend=True,
@@ -1535,14 +1536,14 @@ def plot_mean_quantile_returns_spread_time_series(
     spread_bps = mean_returns_spread * DECIMAL_TO_BPS
     ma = spread_bps.rolling(window=22).mean()
     
-    # Mean returns spread line
+    # Mean returns spread line (thin line with slight transparency)
     fig.add_trace(go.Scatter(
         x=spread_bps.index,
         y=spread_bps.values,
         mode='lines',
         name='mean returns spread',
         line=dict(color='forestgreen', width=0.5),
-        opacity=0.4  # Opacity set at trace level
+        opacity=0.6  # Same as IC time series for consistency
     ))
     
     # 1 month moving average line

@@ -1494,7 +1494,7 @@ def _rebuild_figure_without_compression(fig):
                      'showlegend', 'legendgroup', 'mode', 'marker', 'line', 
                      'fill', 'fillcolor', 'hovertemplate', 'hoverinfo',
                      'colorscale', 'zmid', 'texttemplate', 'textfont', 
-                     'colorbar', 'showscale', 'yaxis', 'xaxis', 'type']
+                     'colorbar', 'showscale', 'yaxis', 'xaxis', 'type', 'opacity']
         
         for field in field_list:
             if hasattr(trace, field):
@@ -1548,6 +1548,18 @@ def _rebuild_figure_without_compression(fig):
                             trace_dict[field] = list(value)
                     else:
                         trace_dict[field] = list(value)
+                elif hasattr(value, 'to_plotly_json'):
+                    # Plotly objects (line, marker, colorbar, etc.) need to be converted to dict
+                    # This ensures width, color, dash, etc. are preserved
+                    # Check if it's actually a Plotly object (not just a dict with to_plotly_json)
+                    if not isinstance(value, dict):
+                        trace_dict[field] = value.to_plotly_json()
+                    else:
+                        # Already a dictionary, keep as is
+                        trace_dict[field] = value
+                elif isinstance(value, dict):
+                    # Already a dictionary, keep as is (preserve all nested properties)
+                    trace_dict[field] = value
                 else:
                     trace_dict[field] = value
         
