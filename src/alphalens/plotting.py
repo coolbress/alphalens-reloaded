@@ -390,6 +390,8 @@ def plot_information_table(ic_data, return_df=False, yearly_win_rate=None):
     ic_summary_table = pd.DataFrame()
     
     ic_summary_table["Risk-Adjusted IC"] = ic_data.mean() / ic_data.std()
+    # Calculate t-stat using entire dataset: tests whether overall IC mean is significantly different from 0
+    # This provides a single summary statistic for the entire time period
     t_stat, p_value = stats.ttest_1samp(ic_data, 0)
     ic_summary_table["t-stat(IC)"] = t_stat
     ic_summary_table["p-value(IC)"] = p_value
@@ -490,17 +492,21 @@ def plot_ic_ts(ic, threshold=None):
     Returns
     -------
     go.Figure
-        Plotly Figure object.
+        Plotly Figure object with subplots:
+        - Row 1: IC and IC moving average
+        - Row 2 (if threshold provided): t-stat MA and threshold lines
     """
     # Convert index to datetime for time series charts
     ic = ic.copy()
     if not isinstance(ic.index, pd.DatetimeIndex):
         ic.index = pd.to_datetime(ic.index)
     
-    fig = go.Figure()
     periods = list(ic.columns)
-    
     actual_periods = []
+    
+    # Create single figure (no subplots)
+    fig = go.Figure()
+    
     for period in periods:
         ic_series = ic[period]
         
@@ -549,8 +555,8 @@ def plot_ic_ts(ic, threshold=None):
         ))
         
         # Zero line
+        x_range = [ic_series.index[0], ic_series.index[-1]]
         if threshold is not None:
-            x_range = [ic_series.index[0], ic_series.index[-1]]
             fig.add_trace(go.Scatter(
                 x=x_range,
                 y=[0.0, 0.0],
@@ -566,44 +572,86 @@ def plot_ic_ts(ic, threshold=None):
             fig.add_hline(y=0, line_dash="solid", line_color="black", 
                          line_width=1, opacity=0.8, visible=is_visible)
         
-        # Threshold lines
+        # Calculate t-stat time series for each IC value (on second y-axis)
         if threshold is not None:
-            # Upper threshold line
+            # Calculate t-stat using rolling window: tests whether rolling mean IC is significantly different from 0 at each point
+            # Unlike the table which uses entire dataset, rolling window captures time-varying statistical significance
+            # This allows tracking how IC significance changes over time, revealing periods of stronger/weaker factor performance
+            # t-stat = (rolling_mean - 0) / (rolling_std / sqrt(rolling_n))
+            rolling_mean = ic_series.rolling(window=22, min_periods=2).mean()
+            rolling_std = ic_series.rolling(window=22, min_periods=2).std()
+            rolling_n = ic_series.rolling(window=22, min_periods=2).count()
+            
+            # Calculate t-stat for each point
+            # Avoid division by zero
+            t_stat_series = pd.Series(index=ic_series.index, dtype=float)
+            valid_mask = (rolling_std > 0) & (rolling_n > 1)
+            t_stat_series[valid_mask] = rolling_mean[valid_mask] / (rolling_std[valid_mask] / np.sqrt(rolling_n[valid_mask]))
+            t_stat_series[~valid_mask] = np.nan
+            
+            # Apply moving average to t-stat series for smoother line visualization
+            # Use same window as IC moving average (22 days = 1 month)
+            # min_periods=1 allows calculation even with fewer than 22 points (for early periods)
+            t_stat_ma = t_stat_series.rolling(window=22, min_periods=1).mean()
+            
+            # T-stat moving average line (on second y-axis) - Only show MA, not raw t-stat
+            fig.add_trace(go.Scatter(
+                x=t_stat_ma.index,
+                y=t_stat_ma.values,
+                mode='lines',
+                name='t-stat(IC) MA',
+                line=dict(
+                    color='orange',
+                    width=2.5,
+                    dash='solid'
+                ),
+                connectgaps=True,  # Connect across NaN gaps to create continuous line
+                visible=is_visible,
+                legendgroup='tstat',
+                showlegend=True,
+                yaxis='y2',
+                hovertemplate='Date: %{x}<br>t-stat MA: %{y:.2f}<extra></extra>'
+            ))
+            
+            # Upper threshold line (on second y-axis) - Red dashed line at +threshold
             fig.add_trace(go.Scatter(
                 x=x_range,
                 y=[threshold, threshold],
                 mode='lines',
                 name=f't-stat = +{threshold}',
                 line=dict(
-                    color='crimson',
-                    width=4.5,
-                    dash='dashdot'
+                    color='red',  # Bright red for better visibility
+                    width=2.0,  # Thick line
+                    dash='dash'  # Dashed line style
                 ),
                 visible=is_visible,
                 legendgroup='threshold',
-                showlegend=False,
+                showlegend=True,  # Show in legend for clarity
                 yaxis='y2',
-                hoverinfo='skip'
+                hoverinfo='skip',
+                hovertemplate=f't-stat = +{threshold} (99% confidence)<extra></extra>'
             ))
             
-            # Lower threshold line
+            # Lower threshold line (on second y-axis) - Red dashed line at -threshold
             fig.add_trace(go.Scatter(
                 x=x_range,
                 y=[-threshold, -threshold],
                 mode='lines',
                 name=f't-stat = -{threshold}',
                 line=dict(
-                    color='crimson',
-                    width=4.5,
-                    dash='dashdot'
+                    color='red',  # Bright red for better visibility
+                    width=2.0,  # Thick line
+                    dash='dash'  # Dashed line style
                 ),
                 visible=is_visible,
                 legendgroup='threshold',
-                showlegend=False,
+                showlegend=True,  # Show in legend for clarity
                 yaxis='y2',
-                hoverinfo='skip'
+                hoverinfo='skip',
+                hovertemplate=f't-stat = -{threshold} (99% confidence)<extra></extra>'
             ))
             
+            # Annotations on t-stat axis (yaxis2)
             upper_text = f"t-stat = +{threshold}<br>(99% confidence)"
             lower_text = f"t-stat = -{threshold}<br>(99% confidence)"
             fig.add_annotation(
@@ -638,8 +686,27 @@ def plot_ic_ts(ic, threshold=None):
                 yanchor="top"
             )
     
+    # Return empty figure if no valid periods
+    if not actual_periods:
+        fig = go.Figure()
+        fig = apply_standard_layout(
+            fig,
+            "Information Coefficient (IC) Time Series",
+            [],
+            xaxis_title="Date",
+            yaxis_title="IC"
+        )
+        return fig
+    
     # Create period toggle buttons
-    traces_per_period = 5 if threshold is not None else 3
+    if threshold is not None:
+        # IC: IC, MA, Zero (3 traces)
+        # t-stat: t-stat MA, Upper threshold, Lower threshold (3 traces)
+        traces_per_period = 6
+    else:
+        # IC only: IC, MA, Zero (3 traces)
+        traces_per_period = 3
+    
     buttons = create_visibility_buttons(actual_periods if actual_periods else periods, traces_per_period, len(fig.data))
     
     # Apply layout
@@ -650,7 +717,9 @@ def plot_ic_ts(ic, threshold=None):
     layout_updates = {}
     
     if threshold is not None:
-        t_stat_range = max(abs(threshold) * 1.5, 5)
+        # Add second y-axis for t-stat scale
+        # Use fixed range based on threshold
+        t_stat_range = max(abs(threshold) * 1.5, 5.0)
         layout_updates["yaxis2"] = dict(
             title="t-statistic",
             overlaying="y",
@@ -669,6 +738,17 @@ def plot_ic_ts(ic, threshold=None):
             bordercolor="rgba(0,0,0,0.2)",
             borderwidth=1
         )
+    else:
+        layout_updates["legend"] = dict(
+            x=1.02,
+            y=1.0,
+            xanchor="left",
+            yanchor="top",
+            bgcolor="rgba(255,255,255,0.8)",
+            bordercolor="rgba(0,0,0,0.2)",
+            borderwidth=1
+        )
+        layout_updates["margin"] = dict(r=120, l=80, t=100, b=60)
     
     fig = apply_standard_layout(
         fig,
@@ -678,20 +758,6 @@ def plot_ic_ts(ic, threshold=None):
         yaxis_title="IC",
         **layout_updates
     )
-    
-    if threshold is None:
-        fig.update_layout(
-            legend=dict(
-                x=1.02,
-                y=1.0,
-                xanchor="left",
-                yanchor="top",
-                bgcolor="rgba(255,255,255,0.8)",
-                bordercolor="rgba(0,0,0,0.2)",
-                borderwidth=1
-            ),
-            margin=dict(r=120, l=80, t=100, b=60)
-        )
     
     # Set x-axis type to 'date' to prevent exponential notation
     fig.update_xaxes(type='date')
@@ -1257,13 +1323,14 @@ def plot_mean_quantile_returns_spread_time_series(
             is_visible = (period == actual_periods[0] if actual_periods else False)
             
             # Mean returns spread line (left y-axis)
+            # Increased transparency to make moving average more visible
             fig.add_trace(go.Scatter(
                 x=spread_bps.index,
                 y=spread_bps.values,
                 mode='lines',
                 name=f'mean returns spread ({period})',
-                line=dict(color='forestgreen', width=1),
-                opacity=0.4,
+                line=dict(color='forestgreen', width=0.5),
+                opacity=0.2,  # Increased transparency (was 0.4) to make moving average more visible
                 visible=is_visible,
                 legendgroup=f'spread_{period}',
                 showlegend=True,
@@ -1277,7 +1344,7 @@ def plot_mean_quantile_returns_spread_time_series(
                 mode='lines',
                 name=f'1 month moving avg ({period})',
                 line=dict(color='orangered', width=2.5),
-                opacity=0.7,
+                opacity=1.0,  # Full opacity for moving average to make it stand out
                 visible=is_visible,
                 legendgroup=f'ma_{period}',
                 showlegend=True,
@@ -1474,7 +1541,7 @@ def plot_mean_quantile_returns_spread_time_series(
         y=spread_bps.values,
         mode='lines',
         name='mean returns spread',
-        line=dict(color='forestgreen', width=1),
+        line=dict(color='forestgreen', width=0.5),
         opacity=0.4  # Opacity set at trace level
     ))
     
@@ -1994,9 +2061,9 @@ def plot_monthly_ic_heatmap(mean_monthly_ic):
         rows=n_rows,
         cols=n_cols,
         subplot_titles=subplot_titles,
-        # Increase vertical spacing to 0.25 to prevent subplot titles from overlapping with chart areas
-        # This creates enough space between upper and lower subplots for titles to fit comfortably
-        vertical_spacing=0.25,
+        # Reduced vertical spacing to bring subplot titles closer together
+        # Still maintains enough space to prevent overlap with chart areas
+        vertical_spacing=0.15,
         horizontal_spacing=0.1
     )
     
