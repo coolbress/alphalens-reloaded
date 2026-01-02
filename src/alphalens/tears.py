@@ -17,6 +17,7 @@ import warnings
 import logging
 from pathlib import Path
 from typing import Dict, Optional, List, Union, Any
+from functools import wraps
 import numpy as np
 import pandas as pd
 from datetime import datetime
@@ -31,6 +32,84 @@ from . import performance as perf
 from . import utils
 
 logger = logging.getLogger("alphalens")
+
+# ---------------------------------------
+# Tear Sheet Result Cache (LRU)
+# ---------------------------------------
+# Cache tear sheet function results for reuse when creating full tear sheet
+_TEAR_SHEET_CACHE_SIZE = 16  # LRU cache size (minimize memory burden)
+
+# Global cache dictionary (LRU implementation)
+_tear_sheet_cache = {}
+_tear_sheet_cache_order = []  # Track LRU order
+
+
+def _get_tear_sheet_cache_key(factor_data, func_name, **kwargs):
+    """
+    Generate cache key for tear sheet function.
+    
+    Parameters
+    ----------
+    factor_data : pd.DataFrame
+        Factor data
+    func_name : str
+        Tear sheet function name
+    **kwargs : dict
+        Function keyword arguments
+    
+    Returns
+    -------
+    str
+        Cache key
+    """
+    # Convert factor_data to hashable key
+    factor_key = utils.make_factor_data_hashable(factor_data, **kwargs)
+    # Combine function name and arguments to create unique key
+    kwargs_str = "_".join(f"{k}={v}" for k, v in sorted(kwargs.items()))
+    return f"{func_name}_{factor_key}_{kwargs_str}"
+
+
+def _get_cached_tear_sheet(cache_key):
+    """
+    Get tear sheet result from cache (with LRU update).
+    
+    Parameters
+    ----------
+    cache_key : str
+        Cache key
+    
+    Returns
+    -------
+    result : dict or None
+        Cached result (None if not found)
+    """
+    if cache_key in _tear_sheet_cache:
+        # LRU: move used item to the end
+        _tear_sheet_cache_order.remove(cache_key)
+        _tear_sheet_cache_order.append(cache_key)
+        return _tear_sheet_cache[cache_key]
+    return None
+
+
+def _set_cached_tear_sheet(cache_key, result):
+    """
+    Store tear sheet result in cache (LRU implementation).
+    
+    Parameters
+    ----------
+    cache_key : str
+        Cache key
+    result : dict
+        Result to store
+    """
+    # Cache size limit (LRU implementation)
+    if len(_tear_sheet_cache) >= _TEAR_SHEET_CACHE_SIZE:
+        # Remove oldest item
+        oldest_key = _tear_sheet_cache_order.pop(0)
+        del _tear_sheet_cache[oldest_key]
+    
+    _tear_sheet_cache[cache_key] = result
+    _tear_sheet_cache_order.append(cache_key)
 
 
 # ---------------------------------------
@@ -361,7 +440,36 @@ def create_returns_tear_sheet(
         plots
     by_group : bool
         If True, display graphs separately for each group.
+    display_output : bool
+        If True, displays plots and tables immediately. If False, returns results as dict.
     """
+    # Generate cache key
+    cache_key = _get_tear_sheet_cache_key(
+        factor_data, 
+        'create_returns_tear_sheet',
+        long_short=long_short,
+        group_neutral=group_neutral,
+        by_group=by_group
+    )
+    
+    # Check cache (always use cache)
+    cached_result = _get_cached_tear_sheet(cache_key)
+    if cached_result is not None:
+        logger.debug(f"Cache hit for create_returns_tear_sheet: {cache_key[:20]}...")
+        # Use cached result if available
+        if display_output:
+            # Display cached result when display_output=True
+            if 'table' in cached_result and cached_result['table'] is not None:
+                utils.print_table(cached_result['table'])
+            if 'worst_periods' in cached_result and cached_result['worst_periods'] is not None:
+                utils.print_table(cached_result['worst_periods'])
+            if 'figures' in cached_result:
+                for fig_name, fig in cached_result['figures'].items():
+                    if fig is not None:
+                        fig.show()
+            return None
+        else:
+            return cached_result
 
     factor_returns = perf.factor_returns(factor_data, long_short, group_neutral)
 
@@ -469,8 +577,9 @@ def create_returns_tear_sheet(
     fig_cumulative = None
     if "1D" in factor_returns:
         # Convert to plotly (single period processing since only 1D is supported)
+        # Pass as DataFrame with MultiIndex (factor_quantile, date) to match expected format
         fig_cumulative = plotting.plot_cumulative_returns_by_quantile(
-            mean_quant_ret_bydate["1D"], period="1D"
+            mean_quant_ret_bydate[["1D"]], period="1D"
         )
         if display_output:
             fig_cumulative.show()
@@ -510,31 +619,9 @@ def create_returns_tear_sheet(
         except Exception as e:
             logger.warning(f"Failed to create underwater plot: {e}")
     
-    # 2. Long/Short Contribution Analysis - toggle support for all periods
-    # Long/Short Contribution Plot must use original non-demeaned returns
-    # to show actual returns for each quantile
-    fig_long_short = None
-    if len(periods_str) > 0:
-        try:
-            # Calculate original returns (demeaned=False)
-            mean_quant_ret_bydate_raw, _ = perf.mean_return_by_quantile(
-                factor_data,
-                by_date=True,
-                by_group=False,
-                demeaned=False,  # Use original returns
-                group_adjust=False,
-            )
-            # mean_quant_ret_bydate_raw already has all periods as columns, so pass directly
-            fig_long_short = plotting.plot_long_short_contribution(
-                mean_quant_ret_bydate=mean_quant_ret_bydate_raw,
-                period=None,  # If None, create toggle for all periods
-                long_short=long_short,
-                group_neutral=group_neutral
-            )
-            if display_output:
-                fig_long_short.show()
-        except Exception as e:
-            logger.warning(f"Failed to create long/short contribution plot: {e}")
+    # Note: Long/Short Contribution (Spread) is now included in cumulative returns by quantile plot
+    # No separate plot needed since Q5 (Long) and Q1 (Short) are already shown,
+    # and Spread (Q5 - Q1) is added to the same graph
     
     # 3. Worst 5 Periods Analysis - for first period
     worst_periods_table = None
@@ -555,40 +642,7 @@ def create_returns_tear_sheet(
     # matplotlib axes no longer needed (replaced with plotly)
     # ax_mean_quantile_returns_spread_ts = None  # Removed: unnecessary variable
 
-    if display_output:
-        # gf is only created when by_group=True, so conditional check is unnecessary
-        # gf is not created when by_group=False
-        pass
-    
-    # Return value composition
-    if not display_output:
-        # ⭐ VertexLens approach: save figure objects first, HTML conversion performed in _render_html()
-        # This ensures HTML conversion happens after figure objects are fully initialized
-        # Store figure objects in dictionary
-        figures_dict = {
-            'quantile_returns': fig_quantile_returns,
-            'spread_time_series': fig_spread_ts,
-        }
-        # Add only if cumulative_returns exists (remove None)
-        if fig_cumulative is not None:
-            figures_dict['cumulative_returns'] = fig_cumulative
-        # Add new analyses
-        if fig_underwater is not None:
-            figures_dict['underwater_drawdown'] = fig_underwater
-        if fig_long_short is not None:
-            figures_dict['long_short_contribution'] = fig_long_short
-        
-        return_dict = {
-            'figures': figures_dict,
-            'table': returns_table
-        }
-        # Add if worst_periods_table exists
-        if worst_periods_table is not None:
-            return_dict['worst_periods'] = worst_periods_table
-        
-        return return_dict
-
-    # by_group processing (only executed when display_output=True)
+    # by_group processing (additional processing when by_group=True)
     fig_quantile_returns_by_group = None
     if by_group:
         (
@@ -614,8 +668,48 @@ def create_returns_tear_sheet(
             by_group=True,
             ylim_percentiles=(5, 95),
         )
-        if display_output:
-            fig_quantile_returns_by_group.show()
+
+    # Always create result as dict (for cache storage and reuse)
+    figures_dict = {
+        'quantile_returns': fig_quantile_returns,
+        'spread_time_series': fig_spread_ts,
+    }
+    # Add only if cumulative_returns exists (remove None)
+    if fig_cumulative is not None:
+        figures_dict['cumulative_returns'] = fig_cumulative
+    # Add new analyses
+    if fig_underwater is not None:
+        figures_dict['underwater_drawdown'] = fig_underwater
+    # Long/Short Contribution (Spread) is now included in cumulative returns by quantile plot
+    # Add by_group figure if exists
+    if fig_quantile_returns_by_group is not None:
+        figures_dict['quantile_returns_by_group'] = fig_quantile_returns_by_group
+    
+    return_dict = {
+        'figures': figures_dict,
+        'table': returns_table
+    }
+    # Add if worst_periods_table exists
+    if worst_periods_table is not None:
+        return_dict['worst_periods'] = worst_periods_table
+    
+    # Store in cache (always)
+    _set_cached_tear_sheet(cache_key, return_dict)
+    
+    # Return or display based on display_output
+    if display_output:
+        # Display to screen
+        if 'table' in return_dict and return_dict['table'] is not None:
+            utils.print_table(return_dict['table'])
+        if 'worst_periods' in return_dict and return_dict['worst_periods'] is not None:
+            utils.print_table(return_dict['worst_periods'])
+        if 'figures' in return_dict:
+            for fig_name, fig in return_dict['figures'].items():
+                if fig is not None:
+                    fig.show()
+        return None
+    else:
+        return return_dict
 
 
 @plotting.customize
@@ -647,6 +741,30 @@ def create_information_tear_sheet(factor_data, group_neutral=False, by_group=Fal
         - 'table': DataFrame containing IC summary table
         If display_output=True, returns None (displays output immediately).
     """
+    # Generate cache key
+    cache_key = _get_tear_sheet_cache_key(
+        factor_data,
+        'create_information_tear_sheet',
+        group_neutral=group_neutral,
+        by_group=by_group
+    )
+    
+    # Check cache (always use cache)
+    cached_result = _get_cached_tear_sheet(cache_key)
+    if cached_result is not None:
+        logger.debug(f"Cache hit for create_information_tear_sheet: {cache_key[:20]}...")
+        # Use cached result if available
+        if display_output:
+            # Display cached result when display_output=True
+            if 'table' in cached_result and cached_result['table'] is not None:
+                utils.print_table(cached_result['table'])
+            if 'figures' in cached_result:
+                for fig_name, fig in cached_result['figures'].items():
+                    if fig is not None:
+                        fig.show()
+            return None
+        else:
+            return cached_result
 
     ic = perf.factor_information_coefficient(factor_data, group_neutral)
 
@@ -695,42 +813,38 @@ def create_information_tear_sheet(factor_data, group_neutral=False, by_group=Fal
     except Exception as e:
         logger.warning(f"Failed to create alpha decay plot: {e}")
 
+    # Always create result as dict (for cache storage and reuse)
+    figures_dict = {
+        'ic_ts': fig_ic_ts,
+    }
+    # Add only if monthly_ic exists (remove None)
+    if fig_monthly_ic is not None:
+        figures_dict['monthly_ic'] = fig_monthly_ic
+    # Add only if ic_by_group exists (remove None)
+    if fig_ic_by_group is not None:
+        figures_dict['ic_by_group'] = fig_ic_by_group
+    # Add only if alpha_decay exists (remove None)
+    if fig_alpha_decay is not None:
+        figures_dict['alpha_decay'] = fig_alpha_decay
+    
+    result = {
+        'figures': figures_dict,
+        'table': ic_summary_table
+    }
+    
+    # Store in cache (always)
+    _set_cached_tear_sheet(cache_key, result)
+    
+    # Return or display based on display_output
     if display_output:
-        # Existing approach: immediate output
+        # Display to screen
         plotting.plot_information_table(ic, yearly_win_rate=win_rate)
-        
-        # Output plotly figures
-        if fig_ic_ts is not None:
-            fig_ic_ts.show()
-        if fig_monthly_ic is not None:
-            fig_monthly_ic.show()
-        if fig_ic_by_group is not None:
-            fig_ic_by_group.show()
-        if fig_alpha_decay is not None:
-            fig_alpha_decay.show()
-        
+        if 'figures' in result:
+            for fig_name, fig in result['figures'].items():
+                if fig is not None:
+                    fig.show()
         return None
     else:
-        # ⭐ VertexLens approach: save figure objects first, HTML conversion performed in _render_html()
-        # Store figure objects in dictionary
-        figures_dict = {
-            'ic_ts': fig_ic_ts,
-        }
-        # Add only if monthly_ic exists (remove None)
-        if fig_monthly_ic is not None:
-            figures_dict['monthly_ic'] = fig_monthly_ic
-        # Add only if ic_by_group exists (remove None)
-        if fig_ic_by_group is not None:
-            figures_dict['ic_by_group'] = fig_ic_by_group
-        # Add only if alpha_decay exists (remove None)
-        if fig_alpha_decay is not None:
-            figures_dict['alpha_decay'] = fig_alpha_decay
-        
-        result = {
-            'figures': figures_dict,
-            'table': ic_summary_table
-        }
-        
         return result
 
 
@@ -766,6 +880,32 @@ def create_turnover_tear_sheet(factor_data, turnover_periods=None, display_outpu
         - 'table': pandas DataFrame
         If display_output=True, returns None (displays output immediately).
     """
+    # turnover_periods를 해시 가능한 형태로 변환
+    turnover_periods_hash = hash(tuple(turnover_periods)) if turnover_periods is not None else None
+    
+    # Generate cache key
+    cache_key = _get_tear_sheet_cache_key(
+        factor_data,
+        'create_turnover_tear_sheet',
+        turnover_periods=turnover_periods_hash
+    )
+    
+    # Check cache (always use cache)
+    cached_result = _get_cached_tear_sheet(cache_key)
+    if cached_result is not None:
+        logger.debug(f"Cache hit for create_turnover_tear_sheet: {cache_key[:20]}...")
+        # Use cached result if available
+        if display_output:
+            # Display cached result when display_output=True
+            if 'table' in cached_result and cached_result['table'] is not None:
+                utils.print_table(cached_result['table'])
+            if 'figures' in cached_result:
+                for fig_name, fig in cached_result['figures'].items():
+                    if fig is not None:
+                        fig.show()
+            return None
+        else:
+            return cached_result
 
     if turnover_periods is None:
         input_periods = utils.get_forward_returns_columns(
@@ -852,23 +992,29 @@ def create_turnover_tear_sheet(factor_data, turnover_periods=None, display_outpu
         if display_output:
             fig_autocorr.show()
     
-    # Return value composition
-    if not display_output:
-        # ⭐ VertexLens approach: save figure objects first, HTML conversion performed in _render_html()
-        # Store figure objects in dictionary
-        # Use already combined table
-        combined_table = combined_turnover_table.T
-        
-        figures_dict = {}
-        if fig_turnover is not None:
-            figures_dict['turnover'] = fig_turnover
-        if fig_autocorr is not None:
-            figures_dict['autocorrelation'] = fig_autocorr
-        
-        return {
-            'figures': figures_dict,
-            'table': combined_table
-        }
+    # Always create result as dict (for cache storage and reuse)
+    combined_table = combined_turnover_table.T
+    
+    figures_dict = {}
+    if fig_turnover is not None:
+        figures_dict['turnover'] = fig_turnover
+    if fig_autocorr is not None:
+        figures_dict['autocorrelation'] = fig_autocorr
+    
+    result = {
+        'figures': figures_dict,
+        'table': combined_table
+    }
+    
+    # Store in cache (always)
+    _set_cached_tear_sheet(cache_key, result)
+    
+    # Return or display based on display_output
+    if display_output:
+        # Display to screen (already displayed above, but for consistency)
+        return None
+    else:
+        return result
 
 
 @plotting.customize
@@ -910,17 +1056,56 @@ def create_full_tear_sheet(
     """
     # Compute phase: perform calculations once and reuse results for both display and HTML saving
     # This prevents duplicate calculations when save_html=True and display_output=True
+    # Check cached results first, compute if not available
     quantile_stats = plotting.plot_quantile_statistics_table(factor_data, return_df=True)
     
-    returns_result = create_returns_tear_sheet(
-        factor_data, long_short, group_neutral, by_group, display_output=False
+    # Returns tear sheet: check cache, compute if not available
+    returns_cache_key = _get_tear_sheet_cache_key(
+        factor_data,
+        'create_returns_tear_sheet',
+        long_short=long_short,
+        group_neutral=group_neutral,
+        by_group=by_group
     )
-    information_result = create_information_tear_sheet(
-        factor_data, group_neutral, by_group, display_output=False
+    returns_result = _get_cached_tear_sheet(returns_cache_key)
+    if returns_result is None:
+        logger.debug("Cache miss for returns_tear_sheet, computing...")
+        returns_result = create_returns_tear_sheet(
+            factor_data, long_short, group_neutral, by_group, display_output=False
+        )
+    else:
+        logger.debug("Cache hit for returns_tear_sheet, reusing cached result")
+    
+    # Information tear sheet: check cache, compute if not available
+    information_cache_key = _get_tear_sheet_cache_key(
+        factor_data,
+        'create_information_tear_sheet',
+        group_neutral=group_neutral,
+        by_group=by_group
     )
-    turnover_result = create_turnover_tear_sheet(
-        factor_data, display_output=False
+    information_result = _get_cached_tear_sheet(information_cache_key)
+    if information_result is None:
+        logger.debug("Cache miss for information_tear_sheet, computing...")
+        information_result = create_information_tear_sheet(
+            factor_data, group_neutral, by_group, display_output=False
+        )
+    else:
+        logger.debug("Cache hit for information_tear_sheet, reusing cached result")
+    
+    # Turnover tear sheet: check cache, compute if not available
+    turnover_cache_key = _get_tear_sheet_cache_key(
+        factor_data,
+        'create_turnover_tear_sheet',
+        turnover_periods=None
     )
+    turnover_result = _get_cached_tear_sheet(turnover_cache_key)
+    if turnover_result is None:
+        logger.debug("Cache miss for turnover_tear_sheet, computing...")
+        turnover_result = create_turnover_tear_sheet(
+            factor_data, display_output=False
+        )
+    else:
+        logger.debug("Cache hit for turnover_tear_sheet, reusing cached result")
     
     # View phase: screen output (when display_output=True)
     if display_output:

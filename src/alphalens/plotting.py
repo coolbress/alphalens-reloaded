@@ -2281,8 +2281,21 @@ def plot_cumulative_returns_by_quantile(quantile_returns, period, freq=None, qua
     -------
     go.Figure
         Plotly Figure object.
+        
+    Notes
+    -----
+    The y-axis uses logarithmic scale to facilitate comparison when cumulative
+    returns differ significantly across quantiles. Without log scale, quantiles
+    with smaller returns may appear flat near zero, making analysis difficult.
+    
+    Only 1D (daily) period is supported for cumulative returns calculation.
+    This is because cumulative returns require daily simple returns that can be
+    compounded over time. Longer periods (e.g., 5D, 10D) represent already
+    cumulative returns over multiple days, and compounding them would create
+    overlapping time periods and meaningless results.
     """
     # Convert index to datetime for time series charts
+    # Handle MultiIndex case where we need to convert only the date level
     if quantile_returns_dict is not None:
         # Convert each DataFrame index in dict to datetime
         quantile_returns_dict = {
@@ -2290,11 +2303,27 @@ def plot_cumulative_returns_by_quantile(quantile_returns, period, freq=None, qua
             for k, v in quantile_returns_dict.items()
         }
         for k, v in quantile_returns_dict.items():
-            if not isinstance(v.index, pd.DatetimeIndex):
+            if isinstance(v.index, pd.MultiIndex):
+                # For MultiIndex, convert only the date level (typically level 1)
+                # The unstack operation will handle the factor_quantile level
+                date_level_idx = v.index.names.index("date") if "date" in v.index.names else 1
+                if not isinstance(v.index.levels[date_level_idx], pd.DatetimeIndex):
+                    new_levels = list(v.index.levels)
+                    new_levels[date_level_idx] = pd.to_datetime(new_levels[date_level_idx])
+                    v.index = v.index.set_levels(new_levels, level=date_level_idx)
+            elif not isinstance(v.index, pd.DatetimeIndex):
                 v.index = pd.to_datetime(v.index)
     else:
         quantile_returns = quantile_returns.copy()
-        if not isinstance(quantile_returns.index, pd.DatetimeIndex):
+        if isinstance(quantile_returns.index, pd.MultiIndex):
+            # For MultiIndex, convert only the date level (typically level 1)
+            # The unstack operation will handle the factor_quantile level
+            date_level_idx = quantile_returns.index.names.index("date") if "date" in quantile_returns.index.names else 1
+            if not isinstance(quantile_returns.index.levels[date_level_idx], pd.DatetimeIndex):
+                new_levels = list(quantile_returns.index.levels)
+                new_levels[date_level_idx] = pd.to_datetime(new_levels[date_level_idx])
+                quantile_returns.index = quantile_returns.index.set_levels(new_levels, level=date_level_idx)
+        elif not isinstance(quantile_returns.index, pd.DatetimeIndex):
             quantile_returns.index = pd.to_datetime(quantile_returns.index)
 
     fig = go.Figure()
@@ -2340,6 +2369,18 @@ def plot_cumulative_returns_by_quantile(quantile_returns, period, freq=None, qua
         
         # Add zero line
         fig.add_hline(y=1.0, line_dash="solid", line_color="black", line_width=1)
+        
+        # Apply logarithmic scale for better visualization of wide ranges
+        # Check if all values are positive (required for log scale)
+        all_cum_values = []
+        for period_key in periods:
+            qr = quantile_returns_dict[period_key]
+            ret_wide = qr.unstack("factor_quantile")
+            cum_ret_period = ret_wide.apply(perf.cumulative_returns)
+            all_cum_values.extend(cum_ret_period.values.flatten())
+        
+        if len(all_cum_values) > 0 and min(all_cum_values) > 0:
+            fig.update_yaxes(type="log", title="Cumulative Returns (Log Scale)")
     else:
         # Handle single period
         ret_wide = quantile_returns.unstack("factor_quantile")
@@ -2358,6 +2399,23 @@ def plot_cumulative_returns_by_quantile(quantile_returns, period, freq=None, qua
                 line=dict(color=color, width=2)
             ))
         
+        # Add Spread (Long - Short) line: Top quantile - Bottom quantile
+        if len(cum_ret.columns) >= 2:
+            top_quantile = cum_ret.columns.max()
+            bottom_quantile = cum_ret.columns.min()
+            top_returns = quantile_returns.unstack("factor_quantile")[top_quantile]
+            bottom_returns = quantile_returns.unstack("factor_quantile")[bottom_quantile]
+            spread_cum = perf.cumulative_returns(top_returns - bottom_returns)
+            
+            fig.add_trace(go.Scatter(
+                x=spread_cum.index,
+                y=spread_cum.values,
+                mode='lines',
+                name=f'Spread (Q{top_quantile} - Q{bottom_quantile})',
+                line=dict(color='steelblue', width=3, dash='dash'),
+                hovertemplate='Date: %{x}<br>Spread: %{y:.4f}<extra></extra>'
+            ))
+        
         fig = apply_standard_layout(
             fig,
             f"Cumulative Return by Quantile ({period} Period Forward Return)",
@@ -2368,14 +2426,20 @@ def plot_cumulative_returns_by_quantile(quantile_returns, period, freq=None, qua
         
         fig.add_hline(y=1.0, line_dash="solid", line_color="black", line_width=1)
         
-        # Set y-axis range
+        # Apply logarithmic scale for better visualization of wide ranges
+        # Include spread values in the check
         all_cum_values = cum_ret.values.flatten()
-        if len(all_cum_values) > 0:
-            y_min = min(all_cum_values)
-            y_max = max(all_cum_values)
-            y_range = y_max - y_min
-            padding = max(y_range * 0.1, 0.1)  # Minimum 0.1 padding
-            fig.update_yaxes(range=[y_min - padding, y_max + padding])
+        if len(cum_ret.columns) >= 2:
+            # Add spread values to the check
+            top_quantile = cum_ret.columns.max()
+            bottom_quantile = cum_ret.columns.min()
+            top_returns = quantile_returns.unstack("factor_quantile")[top_quantile]
+            bottom_returns = quantile_returns.unstack("factor_quantile")[bottom_quantile]
+            spread_cum = perf.cumulative_returns(top_returns - bottom_returns)
+            all_cum_values = np.concatenate([all_cum_values, spread_cum.values])
+        
+        if len(all_cum_values) > 0 and min(all_cum_values) > 0:
+            fig.update_yaxes(type="log", title="Cumulative Returns (Log Scale)")
     
     # Set x-axis type to 'date' to prevent exponential notation
     fig.update_xaxes(type='date')
@@ -2804,355 +2868,6 @@ def plot_underwater_drawdown(drawdown_series, period, mdd=None, mdd_date=None, d
     y_min = min(drawdown_pct.min() * 1.1, -5)  # 10% margin from minimum or -5%
     y_max = 2  # Top margin space
     fig.update_yaxes(range=[y_min, y_max])
-    
-    return fig
-
-
-def plot_long_short_contribution(
-    mean_quant_ret_bydate, period=None, long_short=True, group_neutral=False
-):
-    """
-    Plots Long Leg, Short Leg, and Spread cumulative returns separately.
-    
-    This helps identify whether spread returns come from Long outperformance,
-    Short outperformance, or both.
-    
-    **Calculation Process:**
-    
-    1. **Long Leg**: 
-       - Daily average returns of the quantile with highest factor values (e.g., Q5)
-       - Returns of portfolio that buys (long) stocks in this quantile
-       - Example: If factor is "momentum", returns of top 20% stocks with strongest momentum
-    
-    2. **Short Leg**:
-       - Returns of portfolio that shorts stocks in the quantile with lowest factor values (e.g., Q1)
-       - Shorting reverses returns: if bottom_returns is -5%, shorting yields +5%
-       - Calculation: `cumulative_returns(-bottom_returns)`
-       - Example: If factor is "momentum", returns from shorting bottom 20% stocks with weakest momentum
-    
-    3. **Spread**:
-       - Difference between Long Leg and Short Leg
-       - Calculation: `cumulative_returns(top_returns - bottom_returns)`
-       - Pure returns of Long/Short strategy
-       - Spread increases when Long Leg rises and Short Leg falls
-       - Mathematically: Spread = Long Leg - Short Leg = top_cum - short_cum
-    
-    4. **Cumulative Returns Calculation**:
-       - Calculate cumulative returns by multiplying daily returns of each Leg
-       - `cumulative_returns = (1 + r1) * (1 + r2) * ... * (1 + rn)`
-    
-    **Data Structure:**
-    - `mean_quant_ret_bydate`: MultiIndex DataFrame
-      - Index: (factor_quantile, date) - average returns by quantile and date
-      - Columns: forward return periods (e.g., '5D', '20D', '60D', '120D')
-      - Example: `mean_quant_ret_bydate.loc[(5, '2020-01-01'), '20D']` = 20-day forward return for Q5 quantile on 2020-01-01
-    
-    Parameters
-    ----------
-    mean_quant_ret_bydate : pd.DataFrame
-        Mean returns by quantile and date.
-        Index: factor_quantile (and date if MultiIndex), Columns: forward return periods
-        If multiple periods are present in columns, all will be plotted with toggle.
-    period : str, optional
-        Forward return period (e.g., '20D')
-        If None and mean_quant_ret_bydate has multiple columns, all periods will be plotted.
-        If provided, only that period will be plotted (backward compatibility).
-    long_short : bool, optional
-        Deprecated. Not used in the current implementation.
-        Whether to use long-short portfolio
-    group_neutral : bool, optional
-        Deprecated. Not used in the current implementation.
-        Whether to use group-neutral portfolio
-    
-    Returns
-    -------
-    go.Figure
-        Plotly Figure object.
-    """
-    fig = go.Figure()
-    
-    # If period is None or multiple periods exist: create toggle for all periods
-    if period is None or len(mean_quant_ret_bydate.columns) > 1:
-        # Convert period to number and sort ascending (5D, 20D, 60D order)
-        def period_to_days(p):
-            """Convert period to days (e.g., '5D' -> 5, '20D' -> 20)"""
-            if isinstance(p, str):
-                return int(p.replace('D', ''))
-            elif isinstance(p, (int, float)):
-                return int(p)
-            else:
-                return 0
-        
-        # If period is specified, use only that period; otherwise use all periods
-        if period is not None:
-            periods = [period] if period in mean_quant_ret_bydate.columns else []
-        else:
-            periods = sorted(mean_quant_ret_bydate.columns, key=period_to_days, reverse=False)
-        
-        if not periods:
-            fig = go.Figure()
-            fig.add_annotation(
-                text="No valid periods found",
-                xref="paper", yref="paper",
-                x=0.5, y=0.5,
-                showarrow=False,
-                font=dict(size=14, color="gray")
-            )
-            fig = apply_standard_layout(
-                fig,
-                "Long/Short Contribution Analysis",
-                None,
-                xaxis_title="Date",
-                yaxis_title="Cumulative Returns"
-            )
-            return fig
-        
-        period_labels = [utils.format_period(p) for p in periods]
-        
-        for period_str in periods:
-            if period_str not in mean_quant_ret_bydate.columns:
-                continue
-            
-            is_visible = (period_str == periods[0])
-            
-            # Top and Bottom quantile returns
-            if isinstance(mean_quant_ret_bydate.index, pd.MultiIndex):
-                top_quantile = mean_quant_ret_bydate.index.get_level_values(0).max()
-                bottom_quantile = mean_quant_ret_bydate.index.get_level_values(0).min()
-                
-                top_returns = mean_quant_ret_bydate.xs(top_quantile, level=0)[period_str]
-                bottom_returns = mean_quant_ret_bydate.xs(bottom_quantile, level=0)[period_str]
-            else:
-                top_quantile = mean_quant_ret_bydate.index.max()
-                bottom_quantile = mean_quant_ret_bydate.index.min()
-                
-                top_returns = mean_quant_ret_bydate.loc[top_quantile, period_str]
-                bottom_returns = mean_quant_ret_bydate.loc[bottom_quantile, period_str]
-                
-                if not isinstance(top_returns, pd.Series):
-                    if period_str in mean_quant_ret_bydate.columns:
-                        top_returns = mean_quant_ret_bydate[period_str]
-                    else:
-                        continue
-                if not isinstance(bottom_returns, pd.Series):
-                    if period_str in mean_quant_ret_bydate.columns:
-                        bottom_returns = mean_quant_ret_bydate[period_str]
-                    else:
-                        continue
-            
-            # Calculate cumulative returns
-            # Long Leg: Cumulative returns of Top quantile
-            top_cum = perf.cumulative_returns(top_returns)
-            
-            # Short Leg: Cumulative returns from shorting Bottom quantile
-            # Shorting reverses returns, so cumulative returns of -bottom_returns
-            # Mathematically: (1 + (-r1)) * (1 + (-r2)) * ... = (1 - r1) * (1 - r2) * ...
-            short_cum = perf.cumulative_returns(-bottom_returns)
-            
-            # Spread: Cumulative returns of Long - Short
-            # Cumulative of top_returns - bottom_returns = Long Leg - Short Leg
-            spread_cum = perf.cumulative_returns(top_returns - bottom_returns)
-            
-            # Include period label in name to distinguish each period
-            period_label = utils.format_period(period_str)
-            
-            # Long Leg (Top Quantile)
-            fig.add_trace(go.Scatter(
-                x=top_cum.index,
-                y=top_cum.values,
-                mode='lines',
-                name=f'Long Leg (Q{top_quantile})',
-                line=dict(color='forestgreen', width=2.5),
-                hovertemplate=f'Period: {period_label}<br>Date: %{{x}}<br>Long: %{{y:.4f}}<extra></extra>',
-                visible=is_visible,
-                legendgroup='long_leg',  # Same type of traces in same group
-                showlegend=True  # Show legend for all periods
-            ))
-            
-            # Short Leg (Bottom Quantile) - shorting returns
-            # If bottom_returns is -5%, shorting yields +5%, so short_cum becomes 1.05
-            fig.add_trace(go.Scatter(
-                x=short_cum.index,
-                y=short_cum.values,
-                mode='lines',
-                name=f'Short Leg (Q{bottom_quantile})',
-                line=dict(color='crimson', width=2.5),
-                hovertemplate=f'Period: {period_label}<br>Date: %{{x}}<br>Short: %{{y:.4f}}<extra></extra>',
-                visible=is_visible,
-                legendgroup='short_leg',  # Same type of traces in same group
-                showlegend=True  # Show legend for all periods
-            ))
-            
-            # Spread (Long - Short)
-            # Spread = Long Leg - Short Leg = top_cum - short_cum
-            # This should equal cumulative of top_returns - bottom_returns
-            fig.add_trace(go.Scatter(
-                x=spread_cum.index,
-                y=spread_cum.values,
-                mode='lines',
-                name='Spread (Long - Short)',
-                line=dict(color='steelblue', width=3, dash='dash'),
-                hovertemplate=f'Period: {period_label}<br>Date: %{{x}}<br>Spread: %{{y:.4f}}<extra></extra>',
-                visible=is_visible,
-                legendgroup='spread',  # Same type of traces in same group
-                showlegend=True  # Show legend for all periods
-            ))
-        
-        # Create period toggle buttons (Long + Short + Spread = 3 traces per period)
-        if len(periods) > 1:
-            buttons = create_visibility_buttons(period_labels, 3, len(fig.data))
-            
-            # Apply layout (with toggle buttons)
-            title_text = "Long/Short Contribution Analysis"
-            fig = apply_standard_layout(
-                fig,
-                title_text,
-                [dict(active=0, buttons=buttons, direction="down", x=0.01, xanchor="left", y=1.02, yanchor="bottom")],
-                xaxis_title="Date",
-                yaxis_title="Cumulative Returns",
-                margin=dict(t=100, b=50, l=50, r=50)  # Increase top margin (space for toggle buttons)
-            )
-        else:
-            # No toggle buttons for single period
-            title_text = f"Long/Short Contribution Analysis ({periods[0]})"
-            fig = apply_standard_layout(
-                fig,
-                title_text,
-                None,
-                xaxis_title="Date",
-                yaxis_title="Cumulative Returns"
-            )
-        
-        # Zero line
-        fig.add_hline(
-            y=1.0,
-            line_dash="solid",
-            line_color="black",
-            line_width=1,
-            opacity=0.8
-        )
-        
-        return fig
-    
-    # Handle single period (backward compatibility)
-    # Convert period to string if it's a scalar
-    if not isinstance(period, str):
-        period = str(period)
-    
-    if period not in mean_quant_ret_bydate.columns:
-        fig = go.Figure()
-        fig.add_annotation(
-            text=f"Period '{period}' not found",
-            xref="paper", yref="paper",
-            x=0.5, y=0.5,
-            showarrow=False,
-            font=dict(size=14, color="gray")
-        )
-        fig = apply_standard_layout(
-            fig,
-            f"Long/Short Contribution Analysis ({period})",
-            None,
-            xaxis_title="Date",
-            yaxis_title="Cumulative Returns"
-        )
-        return fig
-    
-    # Top and Bottom quantile returns
-    # mean_quant_ret_bydate has MultiIndex structure (factor_quantile, date)
-    # Index: MultiIndex (factor_quantile, date)
-    # Columns: forward return periods (e.g., '5D', '20D', '60D', '120D')
-    
-    if isinstance(mean_quant_ret_bydate.index, pd.MultiIndex):
-        # MultiIndex case: (factor_quantile, date)
-        top_quantile = mean_quant_ret_bydate.index.get_level_values(0).max()
-        bottom_quantile = mean_quant_ret_bydate.index.get_level_values(0).min()
-        
-        # Select period column for specific quantile (returns date-wise Series)
-        top_returns = mean_quant_ret_bydate.xs(top_quantile, level=0)[period]
-        bottom_returns = mean_quant_ret_bydate.xs(bottom_quantile, level=0)[period]
-    else:
-        # Single Index case (exception)
-        top_quantile = mean_quant_ret_bydate.index.max()
-        bottom_quantile = mean_quant_ret_bydate.index.min()
-        
-        # Check if period is in columns
-        if period in mean_quant_ret_bydate.columns:
-            top_returns = mean_quant_ret_bydate.loc[top_quantile, period]
-            bottom_returns = mean_quant_ret_bydate.loc[bottom_quantile, period]
-            
-            # Handle non-Series case (scalar)
-            if not isinstance(top_returns, pd.Series):
-                # Use same value for all dates (temporary solution)
-                top_returns = pd.Series([top_returns] * len(mean_quant_ret_bydate.index), 
-                                      index=mean_quant_ret_bydate.index)
-            if not isinstance(bottom_returns, pd.Series):
-                bottom_returns = pd.Series([bottom_returns] * len(mean_quant_ret_bydate.index),
-                                          index=mean_quant_ret_bydate.index)
-        else:
-            # Raise error if period not in columns
-            raise ValueError(f"Period '{period}' not found in mean_quant_ret_bydate columns")
-    
-    # Calculate cumulative returns
-    # Long Leg: Cumulative returns of Top quantile
-    top_cum = perf.cumulative_returns(top_returns)
-    
-    # Short Leg: Cumulative returns from shorting Bottom quantile
-    # Shorting reverses returns, so cumulative returns of -bottom_returns
-    short_cum = perf.cumulative_returns(-bottom_returns)
-    
-    # Spread: Cumulative returns of Long - Short
-    spread_cum = perf.cumulative_returns(top_returns - bottom_returns)
-    
-    fig = go.Figure()
-    
-    # Long Leg (Top Quantile)
-    fig.add_trace(go.Scatter(
-        x=top_cum.index,
-        y=top_cum.values,
-        mode='lines',
-        name=f'Long Leg (Q{top_quantile})',
-        line=dict(color='forestgreen', width=2.5),
-        hovertemplate='Date: %{x}<br>Long: %{y:.4f}<extra></extra>'
-    ))
-    
-    # Short Leg (Bottom Quantile) - shorting returns
-    fig.add_trace(go.Scatter(
-        x=short_cum.index,
-        y=short_cum.values,
-        mode='lines',
-        name=f'Short Leg (Q{bottom_quantile})',
-        line=dict(color='crimson', width=2.5),
-        hovertemplate='Date: %{x}<br>Short: %{y:.4f}<extra></extra>'
-    ))
-    
-    # Spread (Long - Short)
-    fig.add_trace(go.Scatter(
-        x=spread_cum.index,
-        y=spread_cum.values,
-        mode='lines',
-        name='Spread (Long - Short)',
-        line=dict(color='steelblue', width=3, dash='dash'),
-        hovertemplate='Date: %{x}<br>Spread: %{y:.4f}<extra></extra>'
-    ))
-    
-    # Zero line
-    fig.add_hline(
-        y=1.0,
-        line_dash="solid",
-        line_color="black",
-        line_width=1,
-        opacity=0.8
-    )
-    
-    # Apply layout
-    title_text = f"Long/Short Contribution Analysis ({period})"
-    fig = apply_standard_layout(
-        fig,
-        title_text,
-        None,
-        xaxis_title="Date",
-        yaxis_title="Cumulative Returns"
-    )
     
     return fig
 

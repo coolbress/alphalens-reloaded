@@ -18,6 +18,7 @@ import numpy as np
 import re
 import warnings
 import logging
+import hashlib
 from pathlib import Path
 from typing import Union, List, Optional, Dict, Tuple
 
@@ -265,7 +266,7 @@ def infer_trading_calendar(factor_idx, prices_idx):
 def compute_forward_returns(
     factor,
     prices,
-    periods=(1, 5, 10),
+    periods=(1, 5, 20, 60),
     filter_zscore=None,
     cumulative_returns=True,
 ):
@@ -753,7 +754,7 @@ def get_clean_factor_and_forward_returns(
     binning_by_group=False,
     quantiles=5,
     bins=None,
-    periods=(1, 5, 10),
+    periods=(1, 5, 20, 60),
     filter_zscore=20,
     groupby_labels=None,
     max_loss=0.35,
@@ -1165,3 +1166,108 @@ def diff_custom_calendar_timedeltas(start, end, freq):
     timediff = end - start
     delta_days = timediff.components.days - actual_days
     return timediff - pd.Timedelta(days=delta_days)
+
+
+def make_factor_data_hashable(factor_data: pd.DataFrame, *args, **kwargs) -> str:
+    """
+    Convert factor_data and function arguments to a hashable string.
+    
+    This function is used for generating keys for LRU cache.
+    Creates a unique hash key based on factor_data's core attributes
+    (shape, index, columns, data hash).
+    
+    Parameters
+    ----------
+    factor_data : pd.DataFrame - MultiIndex
+        Factor data to analyze
+    *args : tuple
+        Additional positional arguments
+    **kwargs : dict
+        Additional keyword arguments
+    
+    Returns
+    -------
+    str
+        Hashable string key
+    
+    Notes
+    -----
+    - Hashing the entire factor_data is expensive, so we combine
+      shape, index hash, columns hash, and sample data hash.
+    - This approach guarantees uniqueness in most cases but is not perfect.
+      Different factor_data with the same data structure may generate the same key.
+    """
+    # Collect core attributes of factor_data
+    data_parts = []
+    
+    # 1. Shape information
+    data_parts.append(f"shape:{factor_data.shape}")
+    
+    # 2. Index hash (date range and asset list)
+    # Performance optimization: use index.levels for MultiIndex to avoid full scan
+    if hasattr(factor_data.index, 'levels'):
+        # MultiIndex case - use levels directly (faster than get_level_values)
+        date_level = factor_data.index.levels[0]
+        asset_level = factor_data.index.levels[1]
+        # Use first/last date instead of min/max for better performance
+        data_parts.append(f"date_range:{date_level[0]}_{date_level[-1]}_{len(date_level)}")
+        # Use sorted unique assets from levels (already unique)
+        data_parts.append(f"assets:{hash(tuple(sorted(asset_level)))}")
+    else:
+        data_parts.append(f"index_hash:{hash(tuple(factor_data.index))}")
+    
+    # 3. Columns information
+    data_parts.append(f"columns:{hash(tuple(factor_data.columns))}")
+    
+    # 4. Data sample hash (first and last few rows)
+    # Hashing entire data is expensive, so use sample only
+    sample_size = min(100, len(factor_data))
+    if sample_size > 0:
+        sample_data = pd.concat([
+            factor_data.head(sample_size // 2),
+            factor_data.tail(sample_size // 2)
+        ])
+        # Hash only numeric data (for NaN handling)
+        numeric_data = sample_data.select_dtypes(include=[np.number])
+        if not numeric_data.empty:
+            # Replace NaN with 0 and hash
+            numeric_values = numeric_data.fillna(0).values
+            data_parts.append(f"data_sample:{hash(numeric_values.tobytes())}")
+    
+    # 5. Additional arguments
+    if args:
+        data_parts.append(f"args:{hash(args)}")
+    if kwargs:
+        # Convert kwargs dict to sorted tuple for hashing
+        sorted_kwargs = tuple(sorted(kwargs.items()))
+        data_parts.append(f"kwargs:{hash(sorted_kwargs)}")
+    
+    # Combine all parts to generate final hash
+    combined = "|".join(data_parts)
+    return hashlib.md5(combined.encode('utf-8')).hexdigest()
+
+
+def clear_tear_sheet_cache():
+    """
+    Clear all tear sheet cache.
+    """
+    from . import tears
+    tears._tear_sheet_cache.clear()
+    tears._tear_sheet_cache_order.clear()
+
+
+def get_tear_sheet_cache_info():
+    """
+    Get tear sheet cache information.
+    
+    Returns
+    -------
+    dict
+        Cache information (maxsize, currsize, keys)
+    """
+    from . import tears
+    return {
+        'maxsize': tears._TEAR_SHEET_CACHE_SIZE,
+        'currsize': len(tears._tear_sheet_cache),
+        'keys': list(tears._tear_sheet_cache.keys())
+    }
